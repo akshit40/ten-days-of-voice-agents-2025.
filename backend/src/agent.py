@@ -19,6 +19,9 @@ from livekit.agents import (
 from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
+# Import the WellnessManager (make sure backend/src/wellness_manager.py exists)
+from wellness_manager import WellnessManager
+
 logger = logging.getLogger("agent")
 load_dotenv(".env.local")
 
@@ -114,8 +117,8 @@ class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(
             instructions="""You are a helpful voice AI assistant. The user is interacting with you via voice.
-You are a friendly barista when the user places an order: ask clarifying questions until the order is complete.
-Keep responses concise and friendly.""",
+You can act as a friendly barista for coffee orders, or as a grounded wellness companion when asked.
+Keep responses concise, calm, and practical. Avoid medical advice — offer only simple, non-diagnostic support.""",
         )
 
 
@@ -164,7 +167,7 @@ async def entrypoint(ctx: JobContext):
     )
 
     # ----------------- Simple session-scoped order managers -----------------
-    # We keep a dict mapping room/session identifier -> OrderManager
+    # maps room/session identifier -> OrderManager
     order_managers: dict[str, OrderManager] = {}
 
     def get_mgr(session_id: str) -> OrderManager:
@@ -172,6 +175,51 @@ async def entrypoint(ctx: JobContext):
             order_managers[session_id] = OrderManager()
         return order_managers[session_id]
 
+    # ----------------- Wellness managers -----------------
+    wellness_managers: dict[str, WellnessManager] = {}
+
+    def get_wellness_mgr(session_id: str) -> WellnessManager:
+        if session_id not in wellness_managers:
+            wellness_managers[session_id] = WellnessManager()
+        return wellness_managers[session_id]
+
+    # ----------------- Respond function factory -----------------
+    def respond_fn_factory(sess, ctx_obj):
+        async def respond_fn(reply_text: str):
+            sent = False
+            try:
+                if hasattr(sess, "send_text") and callable(sess.send_text):
+                    await sess.send_text(reply_text)
+                    sent = True
+            except Exception:
+                logger.debug("session.send_text not available or failed")
+
+            if not sent:
+                try:
+                    if hasattr(sess, "publish_text") and callable(sess.publish_text):
+                        await sess.publish_text(reply_text)
+                        sent = True
+                except Exception:
+                    logger.debug("session.publish_text not available or failed")
+
+            if not sent:
+                try:
+                    agent_obj = getattr(sess, "agent", None)
+                    if agent_obj and hasattr(agent_obj, "send_message"):
+                        await agent_obj.send_message(reply_text)
+                        sent = True
+                except Exception:
+                    logger.debug("agent.send_message not available or failed")
+
+            if not sent:
+                try:
+                    await ctx_obj.room.send_data(reply_text)
+                    sent = True
+                except Exception:
+                    logger.exception("Failed to send reply via any available method")
+        return respond_fn
+
+    # ----------------- Coffee handler -----------------
     async def handle_coffee(session_id: str, user_text: str, respond_fn):
         """
         Update order manager with user_text, ask next question, save when complete.
@@ -210,91 +258,183 @@ async def entrypoint(ctx: JobContext):
             await respond_fn("Sorry, I didn't catch that. Could you repeat please?")
         except Exception as e:
             logger.exception("Error in handle_coffee: %s", e)
+            try:
+                await respond_fn("Something went wrong processing your order.")
+            except Exception:
+                pass
 
-    # ----------------- Transcription event handler -----------------
-    # NOTE: event name 'transcript' is a best-effort choice compatible with typical
-    # livekit-agents versions. If your installed version uses a different event name,
-    # replace "transcript" with the correct event name (for example "transcription").
-    @session.on("transcript")
-    async def _on_transcript(ev):
+    # ----------------- Wellness handler -----------------
+    async def handle_wellness(session_id: str, user_text: str, respond_fn):
         """
-        Called when a new transcript chunk/turn arrives.
-        We attempt to extract text and participant identity, and then drive the order flow.
+        Conduct a short wellness check-in via voice using WellnessManager.
         """
         try:
-            # Several SDK versions use different attribute names; be defensive.
+            mgr = get_wellness_mgr(session_id)
+
+            # Update with user text
+            mgr.update_from_text(user_text)
+
+            # Ask next question if any
+            q = mgr.next_question()
+            if q:
+                await respond_fn(q)
+                # advance asked index so next reply maps to next field
+                mgr._asked_index += 1
+                return
+
+            # If ready to confirm and not yet completed, build summary and ask for save
+            if mgr.is_ready_to_confirm() and not mgr.is_complete():
+                summary = mgr.build_summary()
+                await respond_fn(f"Quick summary: {summary} Do you want me to save this check-in?")
+                mgr._asked_index = len(mgr.QUESTIONS) - 1
+                return
+
+            # If user confirmed (complete)
+            if mgr.is_complete():
+                path, saved_entry = mgr.save()
+                await respond_fn(
+                    f"Saved today's check-in. Summary: {saved_entry.get('summary','')}. I saved it to {path}."
+                )
+                try:
+                    del wellness_managers[session_id]
+                except Exception:
+                    pass
+                return
+
+            # fallback
+            await respond_fn("Sorry, I didn't catch that. Could you repeat or say 'save' to save this check-in?")
+        except Exception as e:
+            logger.exception("Error in handle_wellness: %s", e)
+            try:
+                await respond_fn("Something went wrong with the wellness flow.")
+            except Exception:
+                pass
+
+    # ----------------- Unified defensive incoming event handler -----------------
+    async def _handle_incoming_event(ev):
+        """
+        Extract text from a variety of event shapes, log the raw event, and route to the correct flow.
+        """
+        try:
+            logger.info(">>>> INCOMING EVENT FIRED <<<<")
+            logger.debug("RAW EVENT: %r", ev)
+
             text = None
             session_id = None
 
-            # event may expose multiple attributes; try common ones
+            # common shapes: attributes
             if hasattr(ev, "text"):
                 text = ev.text
             elif hasattr(ev, "transcript"):
                 text = ev.transcript
-            elif isinstance(ev, dict) and "text" in ev:
-                text = ev["text"]
 
-            # determine session id / participant identity
-            if hasattr(ev, "participant") and ev.participant is not None:
-                # some participant objects expose `identity` or `sid`
-                session_id = getattr(ev.participant, "identity", None) or getattr(ev.participant, "sid", None)
-            # fallback to room name
+            # alternatives (common STT shape)
+            elif hasattr(ev, "alternatives") and ev.alternatives:
+                alt0 = ev.alternatives[0]
+                text = getattr(alt0, "transcript", None) or getattr(alt0, "text", None)
+
+            # dict-like event
+            elif isinstance(ev, dict):
+                # try several keys
+                for key in ("text", "transcript", "message", "body"):
+                    if key in ev:
+                        candidate = ev[key]
+                        if isinstance(candidate, dict):
+                            text = candidate.get("text") or candidate.get("transcript")
+                        else:
+                            text = candidate
+                        if text:
+                            break
+                # alternatives in dict
+                if not text and "alternatives" in ev and ev["alternatives"]:
+                    alt0 = ev["alternatives"][0]
+                    if isinstance(alt0, dict):
+                        text = alt0.get("transcript") or alt0.get("text")
+
+            # deeper fallback: ev.message.text
+            if not text:
+                try:
+                    msg = getattr(ev, "message", None)
+                    if msg:
+                        text = getattr(msg, "text", None) or (msg.get("text") if isinstance(msg, dict) else None)
+                except Exception:
+                    pass
+
+            # participant/session id detection
+            try:
+                if hasattr(ev, "participant") and ev.participant is not None:
+                    session_id = getattr(ev.participant, "identity", None) or getattr(ev.participant, "sid", None)
+            except Exception:
+                session_id = None
+
             if not session_id:
                 try:
                     session_id = ctx.room.name
                 except Exception:
                     session_id = "default"
 
+            logger.info("EXTRACTED text: %s", repr(text))
+            logger.info("SESSION_ID used: %s", session_id)
+
             if not text:
-                # nothing to process
+                logger.info("No text found in incoming event - ignoring.")
                 return
 
-            # define respond function: try several possible send methods supported by session
-            async def respond_fn(reply_text: str):
-                # try a few ways to send a textual reply that triggers TTS
-                sent = False
-                try:
-                    # Preferred: session.send_text (if present)
-                    if hasattr(session, "send_text") and callable(session.send_text):
-                        await session.send_text(reply_text)
-                        sent = True
-                except Exception:
-                    logger.debug("session.send_text not available or failed")
+            # normalize text
+            lower = text.lower() if isinstance(text, str) else ""
 
-                if not sent:
-                    try:
-                        # Some SDKs expose `publish_text` or `send` APIs
-                        if hasattr(session, "publish_text") and callable(session.publish_text):
-                            await session.publish_text(reply_text)
-                            sent = True
-                    except Exception:
-                        logger.debug("session.publish_text not available or failed")
-
-                if not sent:
-                    try:
-                        # Try agent-level send if available
-                        agent_obj = getattr(session, "agent", None)
-                        if agent_obj and hasattr(agent_obj, "send_message"):
-                            await agent_obj.send_message(reply_text)
-                            sent = True
-                    except Exception:
-                        logger.debug("agent.send_message not available or failed")
-
-                if not sent:
-                    # Last resort: publish to the room as a data message (room-level)
-                    try:
-                        await ctx.room.send_data(reply_text)
-                        sent = True
-                    except Exception:
-                        logger.exception("Failed to send reply via any available method")
-
-            # Finally call the coffee handler
-            await handle_coffee(session_id, text, respond_fn)
+            # choose flow by keywords
+            wellness_keywords = ("check in", "wellness", "daily check", "start wellness", "how are you feeling", "how am i")
+            if any(kw in lower for kw in wellness_keywords):
+                logger.info("Routing to wellness flow")
+                await handle_wellness(session_id, text, respond_fn_factory(session, ctx))
+            else:
+                # default to coffee flow
+                logger.info("Routing to coffee flow")
+                await handle_coffee(session_id, text, respond_fn_factory(session, ctx))
 
         except Exception as e:
-            logger.exception("transcript handler error: %s", e)
+            logger.exception("Exception in unified handler: %s", e)
 
-    # connect to LiveKit room and start
+    # ----------------- Register handler for common event names -----------------
+    # Attempt to attach to multiple possible event names used by different SDK versions.
+    try:
+        @session.on("transcript")
+        async def _on_transcript(ev):
+            await _handle_incoming_event(ev)
+    except Exception:
+        logger.debug("Failed to attach handler for 'transcript'")
+
+    try:
+        @session.on("transcription")
+        async def _on_transcription(ev):
+            await _handle_incoming_event(ev)
+    except Exception:
+        logger.debug("Failed to attach handler for 'transcription'")
+
+    try:
+        @session.on("message")
+        async def _on_message(ev):
+            await _handle_incoming_event(ev)
+    except Exception:
+        logger.debug("Failed to attach handler for 'message'")
+
+    # Optional: at session start, briefly reference last wellness entry (non-intrusive)
+    try:
+        last = WellnessManager.last_entry()
+        if last:
+            short = last.get("summary") or f"mood: {last.get('mood')}, energy: {last.get('energy')}"
+            try:
+                if hasattr(session, "send_text"):
+                    await session.send_text(f"Welcome back — last time you said: {short}. Would you like to do today's check-in?")
+                else:
+                    await ctx.room.send_data(f"Welcome back — last time you said: {short}. Would you like to do today's check-in?")
+            except Exception:
+                logger.debug("Could not notify room about previous check-in")
+    except Exception:
+        logger.debug("No previous wellness entry or error reading it.")
+
+    # connect to LiveKit room and start listening
     await ctx.connect()
 
 
