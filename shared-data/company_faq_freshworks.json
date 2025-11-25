@@ -1,0 +1,18 @@
+[
+  {
+    "question": "What does your product do?",
+    "answer": "Acme Cloud helps teams manage customer feedback, routing and metrics in one dashboard. It ingests feedback from forms, email and integrations and surfaces trends."
+  },
+  {
+    "question": "Do you have a free tier?",
+    "answer": "We offer a 14-day free trial. For longer free usage, please check our pricing page or contact sales."
+  },
+  {
+    "question": "Who is this for?",
+    "answer": "Our product is for product managers, customer success teams, and engineering teams that need consolidated feedback and analytics."
+  },
+  {
+    "question": "How do I get a demo?",
+    "answer": "Say 'I'd like a demo', and we'll arrange a time. We can also share a recording on request."
+  }
+]
