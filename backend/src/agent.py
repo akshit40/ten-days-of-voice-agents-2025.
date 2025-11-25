@@ -2,6 +2,7 @@
 import logging
 import json
 import os
+import re
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -23,6 +24,9 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 # existing managers (order + wellness) and new tutor manager
 from wellness_manager import WellnessManager
 from tutor_manager import TutorManager
+
+# lead manager for SDR (Day 5)
+from lead_manager import new_lead_template, save_lead, build_summary
 
 logger = logging.getLogger("agent")
 load_dotenv(".env.local")
@@ -100,14 +104,56 @@ class OrderManager:
 #
 class Assistant(Agent):
     def __init__(self) -> None:
+        # SDR persona + multi-role instructions:
         super().__init__(
-            instructions="""You are a helpful voice AI assistant. The user is interacting with you via voice.
-You can act as a friendly barista, a grounded wellness companion, or an active recall tutor. Keep responses concise, practical and non-diagnostic.""",
+            instructions="""
+You are a helpful voice AI assistant that can act in three roles: SDR (Sales Development Rep), wellness check-in companion, and an active-recall tutor.
+When the user expresses interest in product, pricing, demo, or says they're 'interested', prioritize acting as the SDR.
+
+SRD role rules (strict):
+- Greet warmly, be concise, and ask short questions.
+- Use ONLY the provided FAQ JSON (shared-data/company_faq_*.json) to answer product/pricing questions. If the FAQ doesn't contain the info, say: "I don't have that detail — would you like me to book a demo or pass this to our product team?"
+- Goal: understand the user's problem and collect lead fields: name, company, email, role, use_case, team_size, timeline.
+- Ask clarifying questions naturally to collect missing fields.
+- When user says "save" or "that's all" or "thanks", save the lead JSON and read a short summary + path.
+- Do NOT ask for or store sensitive information (cards, IDs, health data).
+- Keep responses short (1-2 sentences) for TTS clarity.
+
+Wellness & Tutor roles:
+- If user requests a daily check-in, act as the wellness companion and persist entries to JSON.
+- If user requests tutoring, support learn / quiz / teach_back flows and track simple mastery.
+
+Keep language friendly, practical, and non-diagnostic. Keep answers concise for TTS.
+"""
         )
 
 
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
+
+
+# --- helper: robust FAQ matching using token overlap
+def best_faq_for_text(user_text: str, faq_list: list[dict]) -> tuple[dict | None, int]:
+    """
+    Return (best_faq_entry, score). Score is simple token overlap of question + important answer tokens.
+    """
+    if not user_text or not faq_list:
+        return None, 0
+    t = user_text.lower()
+    best = None
+    best_score = 0
+    for f in faq_list:
+        q = (f.get("question") or "").lower()
+        a = (f.get("answer") or "").lower()
+        # tokens from question and leading answer tokens
+        tokens = [tok for tok in re.split(r"\W+", q) if tok]
+        tokens += [tok for tok in re.split(r"\W+", a) if tok][:6]
+        # compute overlap score
+        score = sum(1 for tok in set(tokens) if tok and tok in t)
+        if score > best_score:
+            best_score = score
+            best = f
+    return best, best_score
 
 
 async def entrypoint(ctx: JobContext):
@@ -163,13 +209,16 @@ async def entrypoint(ctx: JobContext):
         return wellness_managers[session_id]
 
     # ---------------------------
-    # respond factory (Option 1) - supports per-message voice override
+    # respond factory - supports per-message voice override
     # ---------------------------
     def respond_fn_factory(sess, ctx_obj):
         async def respond_fn(reply_text: str, voice: str | None = None):
+            """
+            Send a reply. Prefer structured payload with tts override (some SDKs accept JSON).
+            Falls back to simple text sends and room data.
+            """
             sent = False
-
-            # 1) Try structured payload with TTS override (some SDKs accept object payloads)
+            # Build structured payload if voice requested
             if voice:
                 payload = {"text": reply_text, "tts": {"voice": voice}}
                 try:
@@ -188,7 +237,7 @@ async def entrypoint(ctx: JobContext):
                 except Exception as e:
                     logger.debug("structured publish_text failed: %s", e)
 
-            # 2) Fallback: plain text sends
+            # Fallback to plain text message
             try:
                 if hasattr(sess, "send_text") and callable(sess.send_text):
                     await sess.send_text(reply_text)
@@ -447,7 +496,174 @@ async def entrypoint(ctx: JobContext):
             except Exception:
                 pass
 
-    # ----------------- Unified incoming handler (unchanged but routes to tutor) -----------------
+    # ----------------- SDR handler (Day 5) -----------------
+    async def handle_sdr(session_id: str, user_text: str, respond_fn):
+        """
+        SDR flow:
+         - greet
+         - answer FAQ driven product questions from shared-data/company_faq_*.json
+         - collect lead fields: name, company, email, role, use_case, team_size, timeline
+         - on 'save' or 'thanks' -> save lead to backend/leads/ and recite summary
+        """
+        try:
+            # session-local storage (attached to function attr)
+            if not hasattr(handle_sdr, "sessions"):
+                handle_sdr.sessions = {}
+            s = handle_sdr.sessions
+            if session_id not in s:
+                s[session_id] = new_lead_template()
+            lead = s[session_id]
+            text = (user_text or "").strip()
+            lower = text.lower()
+
+            # new visitor greeting when the session starts and no name known
+            if not lead.get("name") and any(k in lower for k in ("hello", "hi", "hey", "start sdr", "i'm interested", "i am interested", "interested")):
+                await respond_fn("Hi — thanks for reaching out! I'm the SDR for this demo. What brought you here today? What are you trying to solve?", voice="en-US-matthew")
+                return
+
+            # FAQ lookup: attempt best match using shared-data FAQ (robust)
+            if any(k in lower for k in ("what does", "product", "pricing", "free", "who is it for", "demo", "what makes", "price", "cost", "pricing", "free trial")):
+                try:
+                    # look for any company_faq files in shared-data (pick first matching)
+                    repo_shared = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "shared-data"))
+                    # prefer exact Freshworks sample if present else first company_faq
+                    faq_candidates = [
+                        os.path.join(repo_shared, "company_faq_freshworks.json"),
+                        os.path.join(repo_shared, "company_faq_sample.json"),
+                        os.path.join(repo_shared, "company_faq.json"),
+                    ]
+                    faqs = None
+                    for p in faq_candidates:
+                        if os.path.exists(p):
+                            with open(p, "r", encoding="utf-8") as f:
+                                faqs = json.load(f)
+                            break
+                    # fallback: any json file in shared-data
+                    if faqs is None:
+                        for fname in os.listdir(repo_shared) if os.path.isdir(repo_shared) else []:
+                            pass
+                    if not faqs:
+                        await respond_fn("I don't have product info available right now. Would you like me to schedule a demo?", voice="en-US-matthew")
+                        return
+
+                    best, score = best_faq_for_text(lower, faqs)
+                    if best and score > 0:
+                        # return exact FAQ answer (short)
+                        await respond_fn(best.get("answer", "Sorry I don't have that detail."), voice="en-US-matthew")
+                        return
+                    # fallback: keyword-based small-match
+                    for fentry in faqs:
+                        q = (fentry.get("question") or "").lower()
+                        tokens = [t for t in re.split(r"\W+", q) if t]
+                        if any(tok in lower for tok in tokens[:4]):
+                            await respond_fn(fentry.get("answer", ""), voice="en-US-matthew")
+                            return
+                    # final fallback
+                    await respond_fn("I can answer product/pricing questions or schedule a demo. What would you like to know specifically?", voice="en-US-matthew")
+                except Exception as exc:
+                    logger.exception("FAQ lookup error: %s", exc)
+                    await respond_fn("Sorry — I couldn't load product info right now.", voice="en-US-matthew")
+                return
+
+            # collect name
+            if (not lead.get("name")) and re.search(r"\b(my name is|i am|i'm)\b", lower):
+                try:
+                    # capture after phrase
+                    m = re.search(r"\b(?:my name is|i am|i'm)\b\s*(?P<name>[A-Za-z\-']+)", text, re.IGNORECASE)
+                    if m:
+                        name = m.group("name").strip().capitalize()
+                    else:
+                        name = text.split()[:1][0].capitalize()
+                    if name:
+                        lead["name"] = name
+                        await respond_fn(f"Nice to meet you, {name}. Which company are you with?", voice="en-US-matthew")
+                        return
+                except Exception:
+                    pass
+
+            # collect company by common patterns: "from X", "we are X", "at X", "company is X"
+            if (not lead.get("company")) and any(k in lower for k in ("company", "we are", "from", "i work at", "at ")):
+                m = re.search(r"(?:from|at|company is|we are|we're)\s+([A-Za-z0-9\-\&\s\.]{2,40})", text, re.IGNORECASE)
+                if m:
+                    candidate = m.group(1).strip().strip(".")
+                    company = " ".join(candidate.split()[:6])
+                    lead["company"] = company
+                    await respond_fn(f"Got it — {company}. What's your role there?", voice="en-US-matthew")
+                    return
+                await respond_fn("Which company are you with?", voice="en-US-matthew")
+                return
+
+            # email capture (simple)
+            if (not lead.get("email")) and re.search(r"[\w\.-]+@[\w\.-]+\.\w+", text):
+                m = re.search(r"([\w\.-]+@[\w\.-]+\.\w+)", text)
+                lead["email"] = m.group(1)
+                await respond_fn("Thanks — noted your email. What is your role / title?", voice="en-US-matthew")
+                return
+
+            # role capture (common keywords)
+            if (not lead.get("role")) and any(k in lower for k in ("engineer", "developer", "product", "founder", "ceo", "cto", "manager", "pm", "head", "director")):
+                lead["role"] = text.strip()
+                await respond_fn("Great — could you briefly describe what you'd like to use the product for? (1-2 sentences)", voice="en-US-matthew")
+                return
+
+            # use_case capture (assume a longer sentence)
+            if (not lead.get("use_case")):
+                if len(text.split()) > 6:
+                    lead["use_case"] = text.strip()
+                    await respond_fn("Thanks — that helps. How big is your team? (e.g. 1-10, 10-50, 50+)", voice="en-US-matthew")
+                    return
+
+            # team size
+            if (not lead.get("team_size")) and any(k in lower for k in ("team", "people", "employees", "1-10", "10-50", "50+")):
+                lead["team_size"] = text.strip()
+                await respond_fn("When would you like to start this — now, soon (1-3 months), or later?", voice="en-US-matthew")
+                return
+
+            # timeline
+            if (not lead.get("timeline")) and any(k in lower for k in ("now", "soon", "later", "1-3", "month", "months")):
+                lead["timeline"] = text.strip()
+                await respond_fn("Great — thanks. Anything else you'd like to add or should I save this lead and summary?", voice="en-US-matthew")
+                return
+
+            # explicit save / end of call
+            if any(k in lower for k in ("save", "that is all", "i'm done", "i am done", "thanks", "thank you", "that's all")):
+                lead["collected_at"] = datetime.now().isoformat()
+                # ensure some fields exist for readability
+                if not lead.get("company"):
+                    lead["company"] = "Unknown"
+                path = save_lead(lead)
+                summary = build_summary(lead)
+                await respond_fn(f"Thanks — I saved the lead. Summary: {summary} I stored it at {path}. Our SDR team will follow up at {lead.get('email','the provided email')}.", voice="en-US-matthew")
+                # clear session
+                try:
+                    del handle_sdr.sessions[session_id]
+                except Exception:
+                    pass
+                return
+
+            # guided prompts for missing fields
+            if not lead.get("name"):
+                await respond_fn("Before we go further — what's your name?", voice="en-US-matthew")
+                return
+            if not lead.get("company"):
+                await respond_fn("Which company do you work for?", voice="en-US-matthew")
+                return
+            if not lead.get("email"):
+                await respond_fn("What's the best email to reach you at?", voice="en-US-matthew")
+                return
+            if not lead.get("use_case"):
+                await respond_fn("Can you tell me briefly what you'd like to use this for?", voice="en-US-matthew")
+                return
+
+            await respond_fn("Thanks — I didn't catch that. Could you rephrase or say 'save' to finish and store your details?", voice="en-US-matthew")
+        except Exception as e:
+            logger.exception("SDR handler error: %s", e)
+            try:
+                await respond_fn("Sorry, something went wrong in the SDR flow.", voice="en-US-matthew")
+            except Exception:
+                pass
+
+    # ----------------- Unified incoming handler (routes to flows) -----------------
     async def _handle_incoming_event(ev):
         try:
             logger.info(">>>> INCOMING EVENT FIRED <<<<")
@@ -498,10 +714,18 @@ async def entrypoint(ctx: JobContext):
                 logger.info("No text found in incoming event - ignoring.")
                 return
             lower = text.lower() if isinstance(text, str) else ""
-            # routing priority: tutor -> wellness -> coffee
+
+            # routing priority:
+            # SDR -> tutor -> wellness -> coffee
+            sdr_triggers = ("sales", "pricing", "demo", "book demo", "interested", "contact", "sdr", "lead", "price", "cost", "product", "trial", "free")
             tutor_triggers = ("tutor", "teach me", "teach back", "quiz me", "learn", "quiz", "teach back")
             wellness_triggers = ("check in", "wellness", "daily check", "start wellness", "how are you feeling", "how am i")
-            if any(kw in lower for kw in tutor_triggers):
+
+            # prefer SDR if product/pricing/demo keywords present
+            if any(kw in lower for kw in sdr_triggers):
+                logger.info("Routing to SDR flow")
+                await handle_sdr(session_id, text, respond_fn_factory(session, ctx))
+            elif any(kw in lower for kw in tutor_triggers):
                 logger.info("Routing to tutor flow")
                 await handle_tutor(session_id, text, respond_fn_factory(session, ctx))
             elif any(kw in lower for kw in wellness_triggers):
@@ -553,4 +777,3 @@ async def entrypoint(ctx: JobContext):
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
-
