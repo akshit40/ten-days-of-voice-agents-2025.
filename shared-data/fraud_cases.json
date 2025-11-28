@@ -1,0 +1,34 @@
+[
+  {
+    "id": "case_001",
+    "userName": "John",
+    "securityIdentifier": "SEC123",
+    "cardEnding": "**** 4242",
+    "amount": "₹4,250.00",
+    "currency": "INR",
+    "merchant": "ABC Industries",
+    "transactionTime": "2025-11-25T18:34:00",
+    "transactionCategory": "e-commerce",
+    "transactionSource": "alibaba.com",
+    "security_question": "What is your favourite pet's name?",
+    "security_answer": "fluffy",
+    "status": "pending_review",
+    "notes": ""
+  },
+  {
+    "id": "case_002",
+    "userName": "Priya",
+    "securityIdentifier": "SEC456",
+    "cardEnding": "**** 1111",
+    "amount": "₹12,999.00",
+    "currency": "INR",
+    "merchant": "XYZ Retail",
+    "transactionTime": "2025-11-24T10:05:00",
+    "transactionCategory": "retail",
+    "transactionSource": "example.com",
+    "security_question": "Which city were you born in?",
+    "security_answer": "mumbai",
+    "status": "pending_review",
+    "notes": ""
+  }
+]
