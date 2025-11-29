@@ -1,556 +1,609 @@
-# backend/src/agent.py
-import logging
-import json
-import os
-from datetime import datetime
-from dotenv import load_dotenv
+# IMPROVE THE AGENT AS PER YOUR NEED 1
+"""
+Day 8 – Voice Game Master (D&D-Style Adventure) - Voice-only GM agent
 
+- Uses LiveKit agent plumbing similar to the provided food_agent_sqlite example.
+- GM persona, universe, tone and rules are encoded in the agent instructions.
+- Keeps STT/TTS/Turn detector/VAD integration untouched (murf, deepgram, silero, turn_detector).
+- Tools:
+    - start_adventure(): start a fresh session and introduce the scene
+    - get_scene(): return the current scene description (GM text) ending with "What do you do?"
+    - player_action(action_text): accept player's spoken action, update state, advance scene
+    - show_journal(): list remembered facts, NPCs, named locations, choices
+    - restart_adventure(): reset state and start over
+- Userdata keeps continuity between turns: history, inventory, named NPCs/locations, choices, current_scene
+"""
+
+import json
+import logging
+import os
+import asyncio
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import List, Dict, Optional, Annotated
+
+from dotenv import load_dotenv
+from pydantic import Field
 from livekit.agents import (
     Agent,
     AgentSession,
     JobContext,
     JobProcess,
-    MetricsCollectedEvent,
     RoomInputOptions,
     WorkerOptions,
     cli,
-    metrics,
-    tokenize,
+    function_tool,
+    RunContext,
 )
+
 from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-# existing managers (order + wellness) and new tutor manager
-from wellness_manager import WellnessManager
-from tutor_manager import TutorManager
+# -------------------------
+# Logging
+# -------------------------
+logger = logging.getLogger("voice_game_master")
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+logger.addHandler(handler)
 
-logger = logging.getLogger("agent")
 load_dotenv(".env.local")
 
+# -------------------------
+# Simple Game World Definition
+# -------------------------
+# A compact world with a few scenes and choices forming a mini-arc.
+WORLD = {
+    "intro": {
+        "title": "A Shadow over Brinmere",
+        "desc": (
+            "You awake on the damp shore of Brinmere, the moon a thin silver crescent. "
+            "A ruined watchtower smolders a short distance inland, and a narrow path leads "
+            "towards a cluster of cottages to the east. In the water beside you lies a "
+            "small, carved wooden box, half-buried in sand."
+        ),
+        "choices": {
+            "inspect_box": {
+                "desc": "Inspect the carved wooden box at the water's edge.",
+                "result_scene": "box",
+            },
+            "approach_tower": {
+                "desc": "Head inland towards the smoldering watchtower.",
+                "result_scene": "tower",
+            },
+            "walk_to_cottages": {
+                "desc": "Follow the path east towards the cottages.",
+                "result_scene": "cottages",
+            },
+        },
+    },
+    "box": {
+        "title": "The Box",
+        "desc": (
+            "The box is warm despite the night air. Inside is a folded scrap of parchment "
+            "with a hatch-marked map and the words: 'Beneath the tower, the latch sings.' "
+            "As you read, a faint whisper seems to come from the tower, as if the wind "
+            "itself speaks your name."
+        ),
+        "choices": {
+            "take_map": {
+                "desc": "Take the map and keep it.",
+                "result_scene": "tower_approach",
+                "effects": {"add_journal": "Found map fragment: 'Beneath the tower, the latch sings.'"},
+            },
+            "leave_box": {
+                "desc": "Leave the box where it is.",
+                "result_scene": "intro",
+            },
+        },
+    },
+    "tower": {
+        "title": "The Watchtower",
+        "desc": (
+            "The watchtower's stonework is cracked and warm embers glow within. An iron "
+            "latch covers a hatch at the base — it looks old but recently used. You can "
+            "try the latch, look for other entrances, or retreat."
+        ),
+        "choices": {
+            "try_latch_without_map": {
+                "desc": "Try the iron latch without any clue.",
+                "result_scene": "latch_fail",
+            },
+            "search_around": {
+                "desc": "Search the nearby rubble for another entrance.",
+                "result_scene": "secret_entrance",
+            },
+            "retreat": {
+                "desc": "Step back to the shoreline.",
+                "result_scene": "intro",
+            },
+        },
+    },
+    "tower_approach": {
+        "title": "Toward the Tower",
+        "desc": (
+            "Clutching the map, you approach the watchtower. The map's marks align with "
+            "the hatch at the base, and you notice a faint singing resonance when you step close."
+        ),
+        "choices": {
+            "open_hatch": {
+                "desc": "Use the map clue and try the hatch latch carefully.",
+                "result_scene": "latch_open",
+                "effects": {"add_journal": "Used map clue to open the hatch."},
+            },
+            "search_around": {
+                "desc": "Search for another entrance.",
+                "result_scene": "secret_entrance",
+            },
+            "retreat": {
+                "desc": "Return to the shore.",
+                "result_scene": "intro",
+            },
+        },
+    },
+    "latch_fail": {
+        "title": "A Bad Twist",
+        "desc": (
+            "You twist the latch without heed — the mechanism sticks, and the effort sends "
+            "a shiver through the ground. From inside the tower, something rustles in alarm."
+        ),
+        "choices": {
+            "run_away": {
+                "desc": "Run back to the shore.",
+                "result_scene": "intro",
+            },
+            "stand_ground": {
+                "desc": "Stand and prepare for whatever emerges.",
+                "result_scene": "tower_combat",
+            },
+        },
+    },
+    "latch_open": {
+        "title": "The Hatch Opens",
+        "desc": (
+            "With the map's guidance the latch yields and the hatch opens with a breath of cold air. "
+            "Inside, a spiral of rough steps leads down into an ancient cellar lit by phosphorescent moss."
+        ),
+        "choices": {
+            "descend": {
+                "desc": "Descend into the cellar.",
+                "result_scene": "cellar",
+            },
+            "close_hatch": {
+                "desc": "Close the hatch and reconsider.",
+                "result_scene": "tower_approach",
+            },
+        },
+    },
+    "secret_entrance": {
+        "title": "A Narrow Gap",
+        "desc": (
+            "Behind a pile of rubble you find a narrow gap and old rope leading downward. "
+            "It smells of cold iron and something briny."
+        ),
+        "choices": {
+            "squeeze_in": {
+                "desc": "Squeeze through the gap and follow the rope down.",
+                "result_scene": "cellar",
+            },
+            "mark_and_return": {
+                "desc": "Mark the spot and return to the shore.",
+                "result_scene": "intro",
+            },
+        },
+    },
+    "cellar": {
+        "title": "Cellar of Echoes",
+        "desc": (
+            "The cellar opens into a circular chamber where runes glow faintly. At the center "
+            "is a stone plinth and upon it a small brass key and a sealed scroll."
+        ),
+        "choices": {
+            "take_key": {
+                "desc": "Pick up the brass key.",
+                "result_scene": "cellar_key",
+                "effects": {"add_inventory": "brass_key", "add_journal": "Found brass key on plinth."},
+            },
+            "open_scroll": {
+                "desc": "Break the seal and read the scroll.",
+                "result_scene": "scroll_reveal",
+                "effects": {"add_journal": "Scroll reads: 'The tide remembers what the villagers forget.'"},
+            },
+            "leave_quietly": {
+                "desc": "Leave the cellar and close the hatch behind you.",
+                "result_scene": "intro",
+            },
+        },
+    },
+    "cellar_key": {
+        "title": "Key in Hand",
+        "desc": (
+            "With the key in your hand the runes dim and a hidden panel slides open, revealing a "
+            "small statue that begins to hum. A voice, ancient and kind, asks: 'Will you return what was taken?'"
+        ),
+        "choices": {
+            "pledge_help": {
+                "desc": "Pledge to return what was taken.",
+                "result_scene": "reward",
+                "effects": {"add_journal": "You pledged to return what was taken."},
+            },
+            "refuse": {
+                "desc": "Refuse and pocket the key.",
+                "result_scene": "cursed_key",
+                "effects": {"add_journal": "You pocketed the key; a weight grows in your pocket."},
+            },
+        },
+    },
+    "scroll_reveal": {
+        "title": "The Scroll",
+        "desc": (
+            "The scroll tells of an heirloom taken by a water spirit that dwells beneath the tower. "
+            "It hints that the brass key 'speaks' when offered with truth."
+        ),
+        "choices": {
+            "search_for_key": {
+                "desc": "Search the plinth for a key.",
+                "result_scene": "cellar_key",
+            },
+            "leave_quietly": {
+                "desc": "Leave the cellar and keep the knowledge to yourself.",
+                "result_scene": "intro",
+            },
+        },
+    },
+    "tower_combat": {
+        "title": "Something Emerges",
+        "desc": (
+            "A hunched, brine-soaked creature scrambles out from the tower. Its eyes glow with hunger. "
+            "You must act quickly."
+        ),
+        "choices": {
+            "fight": {
+                "desc": "Fight the creature.",
+                "result_scene": "fight_win",
+            },
+            "flee": {
+                "desc": "Flee back to the shore.",
+                "result_scene": "intro",
+            },
+        },
+    },
+    "fight_win": {
+        "title": "After the Scuffle",
+        "desc": (
+            "You manage to fend off the creature; it flees wailing towards the sea. On the ground lies "
+            "a small locket engraved with a crest — likely the heirloom mentioned in the scroll."
+        ),
+        "choices": {
+            "take_locket": {
+                "desc": "Take the locket and examine it.",
+                "result_scene": "reward",
+                "effects": {"add_inventory": "engraved_locket", "add_journal": "Recovered an engraved locket."},
+            },
+            "leave_locket": {
+                "desc": "Leave the locket and tend to your wounds.",
+                "result_scene": "intro",
+            },
+        },
+    },
+    "reward": {
+        "title": "A Minor Resolution",
+        "desc": (
+            "A small sense of peace settles over Brinmere. Villagers may one day know the heirloom is found, or it may remain a secret. "
+            "You feel the night shift; the little arc of your story here closes for now."
+        ),
+        "choices": {
+            "end_session": {
+                "desc": "End the session and return to the shore (conclude mini-arc).",
+                "result_scene": "intro",
+            },
+            "keep_exploring": {
+                "desc": "Keep exploring for more mysteries.",
+                "result_scene": "intro",
+            },
+        },
+    },
+    "cursed_key": {
+        "title": "A Weight in the Pocket",
+        "desc": (
+            "The brass key glows coldly. You feel a heavy sorrow that tugs at your thoughts. "
+            "Perhaps the key demands something in return..."
+        ),
+        "choices": {
+            "seek_redemption": {
+                "desc": "Seek a way to make amends.",
+                "result_scene": "reward",
+            },
+            "bury_key": {
+                "desc": "Bury the key and hope the weight fades.",
+                "result_scene": "intro",
+            },
+        },
+    },
+}
 
-#
-# ----------------------- OrderManager (unchanged) -----------------------
-#
-class OrderManager:
+# -------------------------
+# Per-session Userdata
+# -------------------------
+@dataclass
+class Userdata:
+    player_name: Optional[str] = None
+    current_scene: str = "intro"
+    history: List[Dict] = field(default_factory=list)  # list of {'scene', 'action', 'time', 'result_scene'}
+    journal: List[str] = field(default_factory=list)
+    inventory: List[str] = field(default_factory=list)
+    named_npcs: Dict[str, str] = field(default_factory=dict)
+    choices_made: List[str] = field(default_factory=list)
+    session_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    started_at: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+
+# -------------------------
+# Helper functions
+# -------------------------
+def scene_text(scene_key: str, userdata: Userdata) -> str:
+    """
+    Build the descriptive text for the current scene, and append choices as short hints.
+    Always end with 'What do you do?' so the voice flow prompts player input.
+    """
+    scene = WORLD.get(scene_key)
+    if not scene:
+        return "You are in a featureless void. What do you do?"
+
+    desc = f"{scene['desc']}\n\nChoices:\n"
+    for cid, cmeta in scene.get("choices", {}).items():
+        desc += f"- {cmeta['desc']} (say: {cid})\n"
+    # GM MUST end with the action prompt
+    desc += "\nWhat do you do?"
+    return desc
+
+def apply_effects(effects: dict, userdata: Userdata):
+    if not effects:
+        return
+    if "add_journal" in effects:
+        userdata.journal.append(effects["add_journal"])
+    if "add_inventory" in effects:
+        userdata.inventory.append(effects["add_inventory"])
+    # Extendable for more effect keys
+
+def summarize_scene_transition(old_scene: str, action_key: str, result_scene: str, userdata: Userdata) -> str:
+    """Record the transition into history and return a short narrative the GM can use."""
+    entry = {
+        "from": old_scene,
+        "action": action_key,
+        "to": result_scene,
+        "time": datetime.utcnow().isoformat() + "Z",
+    }
+    userdata.history.append(entry)
+    userdata.choices_made.append(action_key)
+    return f"You chose '{action_key}'."
+
+# -------------------------
+# Agent Tools (function_tool)
+# -------------------------
+
+@function_tool
+async def start_adventure(
+    ctx: RunContext[Userdata],
+    player_name: Annotated[Optional[str], Field(description="Player name", default=None)] = None,
+) -> str:
+    """Initialize a new adventure session for the player and return the opening description."""
+    userdata = ctx.userdata
+    if player_name:
+        userdata.player_name = player_name
+    userdata.current_scene = "intro"
+    userdata.history = []
+    userdata.journal = []
+    userdata.inventory = []
+    userdata.named_npcs = {}
+    userdata.choices_made = []
+    userdata.session_id = str(uuid.uuid4())[:8]
+    userdata.started_at = datetime.utcnow().isoformat() + "Z"
+
+    opening = (
+        f"Greetings {userdata.player_name or 'traveler'}. Welcome to '{WORLD['intro']['title']}'.\n\n"
+        + scene_text("intro", userdata)
+    )
+    # Ensure GM prompt present
+    if not opening.endswith("What do you do?"):
+        opening += "\nWhat do you do?"
+    return opening
+
+@function_tool
+async def get_scene(
+    ctx: RunContext[Userdata],
+) -> str:
+    """Return the current scene description (useful for 'remind me where I am')."""
+    userdata = ctx.userdata
+    scene_k = userdata.current_scene or "intro"
+    txt = scene_text(scene_k, userdata)
+    return txt
+
+@function_tool
+async def player_action(
+    ctx: RunContext[Userdata],
+    action: Annotated[str, Field(description="Player spoken action or the short action code (e.g., 'inspect_box' or 'take the box')")],
+) -> str:
+    """
+    Accept player's action (natural language or action key), try to resolve it to a defined choice,
+    update userdata, advance to the next scene and return the GM's next description (ending with 'What do you do?').
+    """
+    userdata = ctx.userdata
+    current = userdata.current_scene or "intro"
+    scene = WORLD.get(current)
+    action_text = (action or "").strip()
+
+    # Attempt 1: match exact action key (e.g., 'inspect_box')
+    chosen_key = None
+    if action_text.lower() in (scene.get("choices") or {}):
+        chosen_key = action_text.lower()
+
+    # Attempt 2: fuzzy match by checking if action_text contains the choice key or descriptive words
+    if not chosen_key:
+        # try to find a choice whose description words appear in action_text
+        for cid, cmeta in (scene.get("choices") or {}).items():
+            desc = cmeta.get("desc", "").lower()
+            if cid in action_text.lower() or any(w in action_text.lower() for w in desc.split()[:4]):
+                chosen_key = cid
+                break
+
+    # Attempt 3: fallback by simple keyword matching against choice descriptions
+    if not chosen_key:
+        for cid, cmeta in (scene.get("choices") or {}).items():
+            for keyword in cmeta.get("desc", "").lower().split():
+                if keyword and keyword in action_text.lower():
+                    chosen_key = cid
+                    break
+            if chosen_key:
+                break
+
+    if not chosen_key:
+        # If we still can't resolve, ask a clarifying GM response but keep it short and end with prompt.
+        resp = (
+            "I didn't quite catch that action for this situation. Try one of the listed choices or use a simple phrase like 'inspect the box' or 'go to the tower'.\n\n"
+            + scene_text(current, userdata)
+        )
+        return resp
+
+    # Apply the chosen choice
+    choice_meta = scene["choices"].get(chosen_key)
+    result_scene = choice_meta.get("result_scene", current)
+    effects = choice_meta.get("effects", None)
+
+    # Apply effects (inventory/journal, etc.)
+    apply_effects(effects or {}, userdata)
+
+    # Record transition
+    _note = summarize_scene_transition(current, chosen_key, result_scene, userdata)
+
+    # Update current scene
+    userdata.current_scene = result_scene
+
+    # Build narrative reply: echo a short confirmation, then describe next scene
+    next_desc = scene_text(result_scene, userdata)
+
+    # A small flourish so the GM sounds more persona-driven
+    persona_pre = (
+        "The Game Master (a calm, slightly mysterious narrator) replies:\n\n"
+    )
+    reply = f"{persona_pre}{_note}\n\n{next_desc}"
+    # ensure final prompt present
+    if not reply.endswith("What do you do?"):
+        reply += "\nWhat do you do?"
+    return reply
+
+@function_tool
+async def show_journal(
+    ctx: RunContext[Userdata],
+) -> str:
+    userdata = ctx.userdata
+    lines = []
+    lines.append(f"Session: {userdata.session_id} | Started at: {userdata.started_at}")
+    if userdata.player_name:
+        lines.append(f"Player: {userdata.player_name}")
+    if userdata.journal:
+        lines.append("\nJournal entries:")
+        for j in userdata.journal:
+            lines.append(f"- {j}")
+    else:
+        lines.append("\nJournal is empty.")
+    if userdata.inventory:
+        lines.append("\nInventory:")
+        for it in userdata.inventory:
+            lines.append(f"- {it}")
+    else:
+        lines.append("\nNo items in inventory.")
+    lines.append("\nRecent choices:")
+    for h in userdata.history[-6:]:
+        lines.append(f"- {h['time']} | from {h['from']} -> {h['to']} via {h['action']}")
+    lines.append("\nWhat do you do?")
+    return "\n".join(lines)
+
+@function_tool
+async def restart_adventure(
+    ctx: RunContext[Userdata],
+) -> str:
+    """Reset the userdata and start again."""
+    userdata = ctx.userdata
+    userdata.current_scene = "intro"
+    userdata.history = []
+    userdata.journal = []
+    userdata.inventory = []
+    userdata.named_npcs = {}
+    userdata.choices_made = []
+    userdata.session_id = str(uuid.uuid4())[:8]
+    userdata.started_at = datetime.utcnow().isoformat() + "Z"
+    greeting = (
+        "The world resets. A new tide laps at the shore. You stand once more at the beginning.\n\n"
+        + scene_text("intro", userdata)
+    )
+    if not greeting.endswith("What do you do?"):
+        greeting += "\nWhat do you do?"
+    return greeting
+
+# -------------------------
+# The Agent (GameMasterAgent)
+# -------------------------
+class GameMasterAgent(Agent):
     def __init__(self):
-        self.order = {
-            "drinkType": "",
-            "size": "",
-            "milk": "",
-            "extras": [],
-            "name": "",
-        }
-
-    def update_from_text(self, text: str):
-        if not text:
-            return
-        t = text.lower()
-        for d in ["latte", "cappuccino", "americano", "espresso", "mocha", "cold brew", "flat white"]:
-            if d in t:
-                self.order["drinkType"] = d
-        for s in ["small", "medium", "large"]:
-            if s in t:
-                self.order["size"] = s
-        for m in ["whole", "skim", "oat", "soy", "almond", "2%"]:
-            if m in t:
-                self.order["milk"] = m
-        for ex in ["vanilla", "caramel", "hazelnut", "whipped", "extra shot", "shot"]:
-            if ex in t and ex not in self.order["extras"]:
-                self.order["extras"].append(ex)
-        if "my name is " in t:
-            try:
-                name = t.split("my name is ", 1)[1].strip().split()[0]
-                self.order["name"] = name.capitalize()
-            except Exception:
-                pass
-        elif " for " in t:
-            try:
-                name = t.split(" for ", 1)[1].strip().split()[0]
-                self.order["name"] = name.capitalize()
-            except Exception:
-                pass
-
-    def is_complete(self) -> bool:
-        return bool(self.order["drinkType"] and self.order["size"] and self.order["milk"] and self.order["name"])
-
-    def next_question(self) -> str | None:
-        if not self.order["drinkType"]:
-            return "What would you like to drink today? We have latte, cappuccino, americano, mocha, and espresso."
-        if not self.order["size"]:
-            return "What size would you like — small, medium, or large?"
-        if not self.order["milk"]:
-            return "Which milk would you prefer — whole, skim, oat, soy or almond?"
-        if not self.order["extras"]:
-            return "Any extras — caramel, vanilla, whipped cream, or an extra shot?"
-        if not self.order["name"]:
-            return "Under what name should I put this order?"
-        return None
-
-    def save(self, folder: str = "orders") -> str:
-        os.makedirs(folder, exist_ok=True)
-        filename = f"order_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        path = os.path.join(folder, filename)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.order, f, indent=2, ensure_ascii=False)
-        return path
-
-
-#
-# ----------------------- Agent / Entry point -----------------------
-#
-class Assistant(Agent):
-    def __init__(self) -> None:
+        # System instructions define Universe, Tone, Role
+        instructions = """
+        You are 'Aurek', the Game Master (GM) for a voice-only, Dungeons-and-Dragons-style short adventure.
+        Universe: Low-magic coastal fantasy (village of Brinmere, tide-smoothed ruins, minor spirits).
+        Tone: Slightly mysterious, dramatic, empathetic (not overly scary).
+        Role: You are the GM. You describe scenes vividly, remember the player's past choices, named NPCs, inventory and locations,
+              and you always end your descriptive messages with the prompt: 'What do you do?'
+        Rules:
+            - Use the provided tools to start the adventure, get the current scene, accept the player's spoken action,
+              show the player's journal, or restart the adventure.
+            - Keep continuity using the per-session userdata. Reference journal items and inventory when relevant.
+            - Drive short sessions (aim for several meaningful turns). Each GM message MUST end with 'What do you do?'.
+            - Respect that this agent is voice-first: responses should be concise enough for spoken delivery but evocative.
+        """
         super().__init__(
-            instructions="""You are a helpful voice AI assistant. The user is interacting with you via voice.
-You can act as a friendly barista, a grounded wellness companion, or an active recall tutor. Keep responses concise, practical and non-diagnostic.""",
+            instructions=instructions,
+            tools=[start_adventure, get_scene, player_action, show_journal, restart_adventure],
         )
 
-
+# -------------------------
+# Entrypoint & Prewarm (keeps speech functionality)
+# -------------------------
 def prewarm(proc: JobProcess):
-    proc.userdata["vad"] = silero.VAD.load()
-
+    # load VAD model and stash on process userdata, try/catch like original file
+    try:
+        proc.userdata["vad"] = silero.VAD.load()
+    except Exception:
+        logger.warning("VAD prewarm failed; continuing without preloaded VAD.")
 
 async def entrypoint(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
+    logger.info("\n" + "🎲" * 8)
+    logger.info("🚀 STARTING VOICE GAME MASTER (Brinmere Mini-Arc)")
+
+    userdata = Userdata()
 
     session = AgentSession(
         stt=deepgram.STT(model="nova-3"),
         llm=google.LLM(model="gemini-2.5-flash"),
         tts=murf.TTS(
-            voice="en-US-matthew",
-            style="Conversation",
-            tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
+            voice="en-US-marcus",
+            style="Conversational",
             text_pacing=True,
         ),
         turn_detection=MultilingualModel(),
-        vad=ctx.proc.userdata["vad"],
-        preemptive_generation=True,
+        vad=ctx.proc.userdata.get("vad"),
+        userdata=userdata,
     )
 
-    usage_collector = metrics.UsageCollector()
-
-    @session.on("metrics_collected")
-    def _on_metrics_collected(ev: MetricsCollectedEvent):
-        metrics.log_metrics(ev.metrics)
-        usage_collector.collect(ev.metrics)
-
-    async def log_usage():
-        summary = usage_collector.get_summary()
-        logger.info(f"Usage: {summary}")
-
-    ctx.add_shutdown_callback(log_usage)
-
+    # Start the agent session with the GameMasterAgent
     await session.start(
-        agent=Assistant(),
+        agent=GameMasterAgent(),
         room=ctx.room,
         room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVC()),
     )
 
-    # managers
-    order_managers: dict[str, OrderManager] = {}
-    wellness_managers: dict[str, WellnessManager] = {}
-    tutor = TutorManager()
-    tutor_sessions = {}  # optional per-session quick state (mirrors tutor.sessions)
-
-    def get_mgr(session_id: str) -> OrderManager:
-        if session_id not in order_managers:
-            order_managers[session_id] = OrderManager()
-        return order_managers[session_id]
-
-    def get_wellness_mgr(session_id: str) -> WellnessManager:
-        if session_id not in wellness_managers:
-            wellness_managers[session_id] = WellnessManager()
-        return wellness_managers[session_id]
-
-    # ---------------------------
-    # respond factory (Option 1) - supports per-message voice override
-    # ---------------------------
-    def respond_fn_factory(sess, ctx_obj):
-        async def respond_fn(reply_text: str, voice: str | None = None):
-            sent = False
-
-            # 1) Try structured payload with TTS override (some SDKs accept object payloads)
-            if voice:
-                payload = {"text": reply_text, "tts": {"voice": voice}}
-                try:
-                    if hasattr(sess, "send_text") and callable(sess.send_text):
-                        await sess.send_text(payload)
-                        logger.debug("Sent structured payload via send_text with voice override: %s", voice)
-                        return
-                except Exception as e:
-                    logger.debug("structured send_text failed: %s", e)
-
-                try:
-                    if hasattr(sess, "publish_text") and callable(sess.publish_text):
-                        await sess.publish_text(payload)
-                        logger.debug("Sent structured payload via publish_text with voice override: %s", voice)
-                        return
-                except Exception as e:
-                    logger.debug("structured publish_text failed: %s", e)
-
-            # 2) Fallback: plain text sends
-            try:
-                if hasattr(sess, "send_text") and callable(sess.send_text):
-                    await sess.send_text(reply_text)
-                    sent = True
-            except Exception:
-                logger.debug("session.send_text not available or failed")
-
-            if not sent:
-                try:
-                    if hasattr(sess, "publish_text") and callable(sess.publish_text):
-                        await sess.publish_text(reply_text)
-                        sent = True
-                except Exception:
-                    logger.debug("session.publish_text not available or failed")
-
-            if not sent:
-                try:
-                    agent_obj = getattr(sess, "agent", None)
-                    if agent_obj and hasattr(agent_obj, "send_message"):
-                        await agent_obj.send_message(reply_text)
-                        sent = True
-                except Exception:
-                    logger.debug("agent.send_message not available or failed")
-
-            if not sent:
-                try:
-                    await ctx_obj.room.send_data(reply_text)
-                    sent = True
-                except Exception:
-                    logger.exception("Failed to send reply via any available method")
-
-        return respond_fn
-
-    # coffee handler (unchanged, short)
-    async def handle_coffee(session_id: str, user_text: str, respond_fn):
-        try:
-            mgr = get_mgr(session_id)
-            mgr.update_from_text(user_text)
-            if mgr.is_complete():
-                path = mgr.save()
-                summary_text = f"Perfect — your order is a {mgr.order['size']} {mgr.order['drinkType']} with {mgr.order['milk']} milk"
-                if mgr.order["extras"]:
-                    summary_text += f" and extras: {', '.join(mgr.order['extras'])}"
-                summary_text += f" for {mgr.order['name']}. I've saved it to {path}. Enjoy!"
-                await respond_fn(summary_text)
-                try:
-                    del order_managers[session_id]
-                except Exception:
-                    pass
-                return
-            q = mgr.next_question()
-            if q:
-                await respond_fn(q)
-                return
-            await respond_fn("Sorry, I didn't catch that. Could you repeat please?")
-        except Exception as e:
-            logger.exception("Error in handle_coffee: %s", e)
-            try:
-                await respond_fn("Something went wrong processing your order.")
-            except Exception:
-                pass
-
-    # wellness handler (unchanged)
-    async def handle_wellness(session_id: str, user_text: str, respond_fn):
-        try:
-            mgr = get_wellness_mgr(session_id)
-            mgr.update_from_text(user_text)
-            q = mgr.next_question()
-            if q:
-                await respond_fn(q)
-                mgr._asked_index += 1
-                return
-            if mgr.is_ready_to_confirm() and not mgr.is_complete():
-                summary = mgr.build_summary()
-                await respond_fn(f"Quick summary: {summary} Do you want me to save this check-in?")
-                mgr._asked_index = len(mgr.QUESTIONS) - 1
-                return
-            if mgr.is_complete():
-                path, saved_entry = mgr.save()
-                await respond_fn(f"Saved today's check-in. Summary: {saved_entry.get('summary','')}. I saved it to {path}.")
-                try:
-                    del wellness_managers[session_id]
-                except Exception:
-                    pass
-                return
-            await respond_fn("Sorry, I didn't catch that. Could you repeat or say 'save' to save this check-in?")
-        except Exception as e:
-            logger.exception("Error in handle_wellness: %s", e)
-            try:
-                await respond_fn("Something went wrong with the wellness flow.")
-            except Exception:
-                pass
-
-    # ----------------- Tutor handler (Day 4) -----------------
-    async def handle_tutor(session_id: str, user_text: str, respond_fn):
-        """
-        Handles three modes: learn, quiz, teach_back. User can say:
-        - 'learn variables' or 'learn loops'
-        - 'quiz variables'
-        - 'teach back variables'
-        - 'list concepts'
-        - 'switch to quiz'
-        Additionally supports:
-        - 'which concepts am i weakest' / 'show weakest'
-        - 'show my mastery' / 'my mastery'
-        """
-        try:
-            sess = tutor.start_session(session_id)
-            lower = (user_text or "").lower().strip()
-
-            # -------------------------
-            # quick mastery queries
-            # -------------------------
-            if "which concepts am i weakest" in lower or "which concepts am i weakest at" in lower or "weakest concepts" in lower or "show weakest" in lower:
-                weakest = tutor.get_weakest(session_id, top_n=3)
-                if not weakest:
-                    await respond_fn("I don't have any mastery data yet. Try a teach-back or quiz first.")
-                    return
-                parts = []
-                for cid, score in weakest:
-                    c = tutor.get_concept(cid)
-                    title = c.get("title") if c else cid
-                    parts.append(f"{title}: {score}")
-                await respond_fn("Your weakest concepts are: " + ", ".join(parts))
-                return
-
-            if "show my mastery" in lower or "my mastery" in lower or "show mastery" in lower:
-                m = tutor.get_mastery(session_id)
-                if not m:
-                    await respond_fn("No mastery data yet. Do a quiz or teach-back to start tracking.")
-                    return
-                lines = []
-                for cid, entry in m.items():
-                    c = tutor.get_concept(cid)
-                    title = (c.get("title") if c else cid)
-                    lines.append(f"{title} — avg_score: {entry.get('avg_score')}, last_score: {entry.get('last_score')}, taught_back: {entry.get('times_taught_back')}, quizzed: {entry.get('times_quizzed')}")
-                await respond_fn("Here is your mastery: " + " | ".join(lines))
-                return
-
-            # mode switching requests: look for "learn", "quiz", "teach back"
-            if any(word in lower for word in ("list concepts", "what concepts", "show concepts")):
-                concepts = tutor.list_concepts()
-                if not concepts:
-                    await respond_fn("I don't have any concepts loaded.")
-                    return
-                out = "I can teach these concepts: " + ", ".join([f'{c["title"]} (id: {c["id"]})' for c in concepts])
-                await respond_fn(out)
-                return
-
-            # explicit mode + concept: "learn variables", "quiz loops", "teach back variables"
-            if lower.startswith("learn ") or lower.startswith("quiz ") or lower.startswith("teach back ") or lower.startswith("teach_back "):
-                parts = lower.split()
-                mode = parts[0] if parts[0] != "teach" else (parts[0] + " " + parts[1])  # fallback
-                if parts[0] == "teach":
-                    mode = "teach_back"
-                    concept_keyword = " ".join(parts[2:]) if len(parts) > 2 else None
-                else:
-                    mode = parts[0]
-                    concept_keyword = " ".join(parts[1:]) if len(parts) > 1 else None
-
-                # normalize mode
-                if mode in ("teach", "teach_back", "teachback", "teach-back"):
-                    mode = "teach_back"
-                if mode not in ("learn", "quiz", "teach_back"):
-                    await respond_fn("I didn't understand that mode. Say learn, quiz, or teach back.")
-                    return
-
-                tutor.set_mode(session_id, mode, concept_keyword)
-                c = tutor.get_concept(tutor.get_session(session_id)["current_concept"])
-                if not c:
-                    await respond_fn("I couldn't find that concept.")
-                    return
-
-                if mode == "learn":
-                    # use per-message voice override for learn (Matthew)
-                    # record that we explained this concept
-                    tutor.record_explain(session_id, c["id"])
-                    await respond_fn(f"Learn mode — {c['title']}: {c['summary']}", voice="en-US-matthew")
-                    return
-
-                if mode == "quiz":
-                    # quiz voice (Alicia)
-                    q = tutor.ask_quiz_question(session_id)
-                    await respond_fn(f"Quiz mode — question: {q}", voice="en-US-alicia")
-                    return
-
-                if mode == "teach_back":
-                    # teach-back voice (Ken)
-                    prompt = tutor.ask_teach_back_prompt(session_id)
-                    await respond_fn(prompt, voice="en-US-ken")
-                    return
-
-            # switch requests "switch to quiz" / "switch to learn"
-            if "switch to" in lower or lower.startswith("switch "):
-                if "quiz" in lower:
-                    tutor.set_mode(session_id, "quiz")
-                    q = tutor.ask_quiz_question(session_id)
-                    await respond_fn(f"Switched to quiz. {q}", voice="en-US-alicia")
-                    return
-                if "learn" in lower:
-                    tutor.set_mode(session_id, "learn")
-                    c = tutor.get_concept(tutor.get_session(session_id)["current_concept"])
-                    # record explain exposure
-                    if c:
-                        tutor.record_explain(session_id, c["id"])
-                        await respond_fn(f"Switched to learn. {c['title']}: {c['summary']}", voice="en-US-matthew")
-                    else:
-                        await respond_fn("Switched to learn but I couldn't find the concept.", voice="en-US-matthew")
-                    return
-                if "teach" in lower:
-                    tutor.set_mode(session_id, "teach_back")
-                    p = tutor.ask_teach_back_prompt(session_id)
-                    await respond_fn(f"Switched to teach-back. {p}", voice="en-US-ken")
-                    return
-
-            # If user answered a quiz question (we assume last_question present)
-            sess_state = tutor.get_session(session_id)
-            last_q = sess_state.get("last_question") if sess_state else None
-            current_cid = sess_state.get("current_concept") if sess_state else None
-            if sess_state and sess_state.get("mode") == "quiz" and last_q:
-                # evaluate answer via teach_back evaluator
-                c = tutor.get_concept(current_cid)
-                summary = c.get("summary", "") if c else ""
-                eval_res = tutor.evaluate_teach_back(summary, user_text)
-                correct = eval_res["score"] >= 60
-                tutor.record_quiz_result(session_id, current_cid, correct)
-                if correct:
-                    await respond_fn(f"Good answer — you included the key ideas. {eval_res['feedback']}", voice="en-US-alicia")
-                else:
-                    await respond_fn(f"Not quite. {eval_res['feedback']} Here's a quick hint: {summary}", voice="en-US-alicia")
-                return
-
-            # If in teach_back mode expecting explanation
-            if sess_state and sess_state.get("mode") == "teach_back" and sess_state.get("last_question"):
-                c = tutor.get_concept(sess_state.get("current_concept"))
-                summary = c.get("summary", "") if c else ""
-                eval_res = tutor.evaluate_teach_back(summary, user_text)
-                # record taught back score
-                if c:
-                    tutor.record_taught_back(session_id, c["id"], eval_res["score"])
-                await respond_fn(f"I scored your explanation {eval_res['score']} out of 100. {eval_res['feedback']}", voice="en-US-ken")
-                return
-
-            # If none of above: see if user asked to start tutoring without explicit mode
-            if any(k in lower for k in ("tutor", "teach", "teach me", "i want to learn", "quiz me")):
-                # default to an interactive prompt asking which mode
-                await respond_fn("Sure — would you like to 'learn' the concept, 'quiz' yourself, or 'teach back'? Say: learn variables, quiz loops, or teach back variables.")
-                return
-
-            # fallback: didn't recognize as tutor input
-            await respond_fn("Tutor: I didn't quite catch a tutor command. Say 'list concepts' or 'learn variables' or 'quiz loops' or 'teach back variables'.")
-        except Exception as e:
-            logger.exception("Error in handle_tutor: %s", e)
-            try:
-                await respond_fn("Something went wrong in the tutor flow.")
-            except Exception:
-                pass
-
-    # ----------------- Unified incoming handler (unchanged but routes to tutor) -----------------
-    async def _handle_incoming_event(ev):
-        try:
-            logger.info(">>>> INCOMING EVENT FIRED <<<<")
-            logger.debug("RAW EVENT: %r", ev)
-            text = None
-            session_id = None
-            if hasattr(ev, "text"):
-                text = ev.text
-            elif hasattr(ev, "transcript"):
-                text = ev.transcript
-            elif hasattr(ev, "alternatives") and ev.alternatives:
-                alt0 = ev.alternatives[0]
-                text = getattr(alt0, "transcript", None) or getattr(alt0, "text", None)
-            elif isinstance(ev, dict):
-                for key in ("text", "transcript", "message", "body"):
-                    if key in ev:
-                        candidate = ev[key]
-                        if isinstance(candidate, dict):
-                            text = candidate.get("text") or candidate.get("transcript")
-                        else:
-                            text = candidate
-                        if text:
-                            break
-                if not text and "alternatives" in ev and ev["alternatives"]:
-                    alt0 = ev["alternatives"][0]
-                    if isinstance(alt0, dict):
-                        text = alt0.get("transcript") or alt0.get("text")
-            if not text:
-                try:
-                    msg = getattr(ev, "message", None)
-                    if msg:
-                        text = getattr(msg, "text", None) or (msg.get("text") if isinstance(msg, dict) else None)
-                except Exception:
-                    pass
-            try:
-                if hasattr(ev, "participant") and ev.participant is not None:
-                    session_id = getattr(ev.participant, "identity", None) or getattr(ev.participant, "sid", None)
-            except Exception:
-                session_id = None
-            if not session_id:
-                try:
-                    session_id = ctx.room.name
-                except Exception:
-                    session_id = "default"
-            logger.info("EXTRACTED text: %s", repr(text))
-            logger.info("SESSION_ID used: %s", session_id)
-            if not text:
-                logger.info("No text found in incoming event - ignoring.")
-                return
-            lower = text.lower() if isinstance(text, str) else ""
-            # routing priority: tutor -> wellness -> coffee
-            tutor_triggers = ("tutor", "teach me", "teach back", "quiz me", "learn", "quiz", "teach back")
-            wellness_triggers = ("check in", "wellness", "daily check", "start wellness", "how are you feeling", "how am i")
-            if any(kw in lower for kw in tutor_triggers):
-                logger.info("Routing to tutor flow")
-                await handle_tutor(session_id, text, respond_fn_factory(session, ctx))
-            elif any(kw in lower for kw in wellness_triggers):
-                logger.info("Routing to wellness flow")
-                await handle_wellness(session_id, text, respond_fn_factory(session, ctx))
-            else:
-                logger.info("Routing to coffee flow")
-                await handle_coffee(session_id, text, respond_fn_factory(session, ctx))
-        except Exception as e:
-            logger.exception("Exception in unified handler: %s", e)
-
-    # register handlers
-    try:
-        @session.on("transcript")
-        async def _on_transcript(ev):
-            await _handle_incoming_event(ev)
-    except Exception:
-        logger.debug("Failed to attach handler for 'transcript'")
-    try:
-        @session.on("transcription")
-        async def _on_transcription(ev):
-            await _handle_incoming_event(ev)
-    except Exception:
-        logger.debug("Failed to attach handler for 'transcription'")
-    try:
-        @session.on("message")
-        async def _on_message(ev):
-            await _handle_incoming_event(ev)
-    except Exception:
-        logger.debug("Failed to attach handler for 'message'")
-
-    # mention last wellness entry non-intrusively
-    try:
-        last = WellnessManager.last_entry()
-        if last:
-            short = last.get("summary") or f"mood: {last.get('mood')}, energy: {last.get('energy')}"
-            try:
-                if hasattr(session, "send_text"):
-                    await session.send_text(f"Welcome back — last time you said: {short}. Would you like to do today's check-in?")
-                else:
-                    await ctx.room.send_data(f"Welcome back — last time you said: {short}. Would you like to do today's check-in?")
-            except Exception:
-                logger.debug("Could not notify room about previous check-in")
-    except Exception:
-        logger.debug("No previous wellness entry or error reading it.")
-
     await ctx.connect()
-
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
-
