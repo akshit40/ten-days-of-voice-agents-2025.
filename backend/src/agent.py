@@ -1,556 +1,343 @@
-# backend/src/agent.py
-import logging
-import json
-import os
-from datetime import datetime
-from dotenv import load_dotenv
+"""
+Day 10 – Voice Improv Battle
 
+This file adapts the Day 9 voice Game Master agent into a voice-first improv
+show host called "Improv Battle". The original voice/STT/TTS/turn-detection/VAD
+plumbing and imports are preserved so it fits into the same voice runtime.
+
+Behaviour summary (implemented as tools exposed to the LLM):
+- start_show(name, max_rounds): initialise session state and introduce the show
+- next_scenario(): advance to the next improv scenario and put the host into awaiting_improv phase
+- record_performance(performance): save the player's improvisation, produce a host reaction
+- summarize_show(): produce a closing summary once rounds complete
+- stop_show(confirm=False): allow graceful early exit
+
+The GameMasterAgent uses these tools and acts as the high-energy improv host.
+"""
+
+import json
+import logging
+import os
+import asyncio
+import uuid
+import random
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import List, Dict, Optional, Annotated
+
+from dotenv import load_dotenv
+from pydantic import Field
 from livekit.agents import (
     Agent,
     AgentSession,
     JobContext,
     JobProcess,
-    MetricsCollectedEvent,
     RoomInputOptions,
     WorkerOptions,
     cli,
-    metrics,
-    tokenize,
+    function_tool,
+    RunContext,
 )
+
 from livekit.plugins import murf, silero, google, deepgram, noise_cancellation
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
-# existing managers (order + wellness) and new tutor manager
-from wellness_manager import WellnessManager
-from tutor_manager import TutorManager
+# -------------------------
+# Logging
+# -------------------------
+logger = logging.getLogger("voice_improv_battle")
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+logger.addHandler(handler)
 
-logger = logging.getLogger("agent")
 load_dotenv(".env.local")
 
+# -------------------------
+# Improv Scenarios (seeded)
+# -------------------------
+# Each scenario is a clear short prompt: role, situation, tension/hook
+SCENARIOS = [
+    "You are a barista who has to tell a customer that their latte is actually a portal to another dimension.",
+    "You are a time-travelling tour guide explaining modern smartphones to someone from the 1800s.",
+    "You are a restaurant waiter who must calmly tell a customer that their order has escaped the kitchen.",
+    "You are a customer trying to return an obviously cursed object to a very skeptical shop owner.",
+    "You are an overenthusiastic TV infomercial host selling a product that clearly does not work as advertised.",
+    "You are an astronaut who just discovered the ship's coffee machine has developed a personality.",
+    "You are a nervous wedding officiant who keeps getting the couple's names mixed up in ridiculous ways.",
+    "You are a ghost trying to give a performance review to a living employee.",
+    "You are a medieval king reacting to a very modern delivery service showing up at court.",
+    "You are a detective interrogating a suspect who only answers in awkward metaphors."
+]
 
-#
-# ----------------------- OrderManager (unchanged) -----------------------
-#
-class OrderManager:
+# -------------------------
+# Per-session Improv State
+# -------------------------
+@dataclass
+class Userdata:
+    player_name: Optional[str] = None
+    session_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    started_at: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+    improv_state: Dict = field(default_factory=lambda: {
+        "current_round": 0,
+        "max_rounds": 3,
+        "rounds": [],  # each: {"scenario": str, "performance": str, "reaction": str}
+        "phase": "idle",  # "intro" | "awaiting_improv" | "reacting" | "done" | "idle"
+        "used_indices": []
+    })
+    history: List[Dict] = field(default_factory=list)
+
+# -------------------------
+# Helpers
+# -------------------------
+
+def _pick_scenario(userdata: Userdata) -> str:
+    used = userdata.improv_state.get("used_indices", [])
+    candidates = [i for i in range(len(SCENARIOS)) if i not in used]
+    if not candidates:
+        # reset if we exhausted scenarios
+        userdata.improv_state["used_indices"] = []
+        candidates = list(range(len(SCENARIOS)))
+    idx = random.choice(candidates)
+    userdata.improv_state["used_indices"].append(idx)
+    return SCENARIOS[idx]
+
+
+def _host_reaction_text(performance: str) -> str:
+    # Lightweight heuristic to vary reaction tone
+    tones = ["supportive", "neutral", "mildly_critical"]
+    tone = random.choice(tones)
+    # Quick keyword detection to pick specific highlights (not exhaustive)
+    highlights = []
+    if any(w in performance.lower() for w in ("funny", "lol", "hahaha", "haha")):
+        highlights.append("great comedic timing")
+    if any(w in performance.lower() for w in ("sad", "cry", "tears")):
+        highlights.append("good emotional depth")
+    if any(w in performance.lower() for w in ("pause", "...")):
+        highlights.append("interesting use of silence")
+    if not highlights:
+        # fallback picks
+        highlights.append(random.choice(["nice character choices", "bold commitment", "unexpected twist"]))
+
+    chosen = random.choice(highlights)
+    if tone == "supportive":
+        return f"Love that — {chosen}! That was playful and clear. Nice work. Ready for the next one?"
+    elif tone == "neutral":
+        return f"Hmm — {chosen}. That landed in parts; you had interesting ideas. Let's try the next scene and lean into one choice."
+    else:  # mildly_critical
+        return f"Okay — {chosen}, but that felt a bit rushed. Try to make stronger choices next time. Don't be afraid to exaggerate."
+
+# -------------------------
+# Agent Tools
+# -------------------------
+@function_tool
+async def start_show(
+    ctx: RunContext[Userdata],
+    name: Annotated[Optional[str], Field(description="Player/contestant name (optional)", default=None)] = None,
+    max_rounds: Annotated[int, Field(description="Number of rounds (3-5 recommended)", default=3)] = 3,
+) -> str:
+    userdata = ctx.userdata
+    if name:
+        userdata.player_name = name.strip()
+    else:
+        # attempt to set player_name from history if present
+        userdata.player_name = userdata.player_name or "Contestant"
+
+    # clamp rounds
+    if max_rounds < 1:
+        max_rounds = 1
+    if max_rounds > 8:
+        max_rounds = 8
+
+    userdata.improv_state["max_rounds"] = int(max_rounds)
+    userdata.improv_state["current_round"] = 0
+    userdata.improv_state["rounds"] = []
+    userdata.improv_state["phase"] = "intro"
+    userdata.history.append({"time": datetime.utcnow().isoformat() + "Z", "action": "start_show", "name": userdata.player_name})
+
+    intro = (
+        f"Welcome to Improv Battle! I'm your host — let's get ready to play."
+        f" {userdata.player_name or 'Contestant'}, we'll run {userdata.improv_state['max_rounds']} rounds. "
+        "Rules: I'll give you a quick scene, you'll improvise in character. When you're done say 'End scene' or pause — I'll react and move on. Have fun!"
+    )
+    # After intro, immediately provide first scenario for flow convenience
+    scenario = _pick_scenario(userdata)
+    userdata.improv_state["current_round"] = 1
+    userdata.improv_state["phase"] = "awaiting_improv"
+    userdata.history.append({"time": datetime.utcnow().isoformat() + "Z", "action": "present_scenario", "round": 1, "scenario": scenario})
+
+    return intro + "\nRound 1: " + scenario + "\nStart improvising now!"
+
+
+@function_tool
+async def next_scenario(ctx: RunContext[Userdata]) -> str:
+    userdata = ctx.userdata
+    if userdata.improv_state.get("phase") == "done":
+        return "The show is already over. Say 'start show' to play again."
+
+    cur = userdata.improv_state.get("current_round", 0)
+    maxr = userdata.improv_state.get("max_rounds", 3)
+    if cur >= maxr:
+        userdata.improv_state["phase"] = "done"
+        return await summarize_show(ctx)
+
+    # advance
+    next_round = cur + 1
+    scenario = _pick_scenario(userdata)
+    userdata.improv_state["current_round"] = next_round
+    userdata.improv_state["phase"] = "awaiting_improv"
+    userdata.history.append({"time": datetime.utcnow().isoformat() + "Z", "action": "present_scenario", "round": next_round, "scenario": scenario})
+    return f"Round {next_round}: {scenario}\nGo!"
+
+
+@function_tool
+async def record_performance(
+    ctx: RunContext[Userdata],
+    performance: Annotated[str, Field(description="Player's improv performance (transcribed text)")],
+) -> str:
+    userdata = ctx.userdata
+    if userdata.improv_state.get("phase") != "awaiting_improv":
+        # still accept performance but warn
+        userdata.history.append({"time": datetime.utcnow().isoformat() + "Z", "action": "record_performance_out_of_phase"})
+
+    round_no = userdata.improv_state.get("current_round", 0)
+    scenario = userdata.history[-1].get("scenario") if userdata.history and userdata.history[-1].get("action") == "present_scenario" else "(unknown)"
+
+    reaction = _host_reaction_text(performance)
+
+    userdata.improv_state["rounds"].append({
+        "round": round_no,
+        "scenario": scenario,
+        "performance": performance,
+        "reaction": reaction,
+    })
+    userdata.improv_state["phase"] = "reacting"
+    userdata.history.append({"time": datetime.utcnow().isoformat() + "Z", "action": "record_performance", "round": round_no})
+
+    # If we've reached max rounds, change to done after reaction
+    if round_no >= userdata.improv_state.get("max_rounds", 3):
+        userdata.improv_state["phase"] = "done"
+        closing = "\n" + reaction + "\nThat's the final round. "
+        closing += (await summarize_show(ctx))
+        return closing
+
+    # otherwise prompt for next round
+    closing = reaction + "\nWhen you're ready, say 'Next' or I'll give you the next scene."
+    return closing
+
+
+@function_tool
+async def summarize_show(ctx: RunContext[Userdata]) -> str:
+    userdata = ctx.userdata
+    rounds = userdata.improv_state.get("rounds", [])
+    if not rounds:
+        return "No rounds were played. Thanks for stopping by Improv Battle!"
+
+    # Simple summary heuristics: count supportive vs critical words, highlight standout moments
+    summary_lines = [f"Thanks for playing, {userdata.player_name or 'Contestant'}! Here's a short recap:"]
+    # highlight each round briefly
+    for r in rounds:
+        perf_snip = (r.get("performance") or "").strip()
+        if len(perf_snip) > 80:
+            perf_snip = perf_snip[:77] + "..."
+        summary_lines.append(f"Round {r.get('round')}: {r.get('scenario')} — You: '{perf_snip}' | Host: {r.get('reaction')}")
+
+    # aggregate a simple profile
+    mentions_character = sum(1 for r in rounds if any(w in (r.get('performance') or '').lower() for w in ('i am', "i'm", 'as a', 'character', 'role')))
+    mentions_emotion = sum(1 for r in rounds if any(w in (r.get('performance') or '').lower() for w in ('sad', 'angry', 'happy', 'love', 'cry', 'tears')))
+
+    profile = "You seem to be a player who "
+    if mentions_character > len(rounds) / 2:
+        profile += "commits to character choices"
+    elif mentions_emotion > 0:
+        profile += "brings emotional color to scenes"
+    else:
+        profile += "likes surprising beats and twists"
+
+    profile += ". Keep leaning into clear choices and stronger stakes."
+
+    summary_lines.append(profile)
+    summary_lines.append("Thanks for performing on Improv Battle — hope to see you again!")
+
+    userdata.history.append({"time": datetime.utcnow().isoformat() + "Z", "action": "summarize_show"})
+    return "\n".join(summary_lines)
+
+
+@function_tool
+async def stop_show(ctx: RunContext[Userdata], confirm: Annotated[bool, Field(description="Confirm stop", default=False)] = False) -> str:
+    userdata = ctx.userdata
+    if not confirm:
+        return "Are you sure you want to stop the show? Say 'stop show yes' to confirm."
+    userdata.improv_state["phase"] = "done"
+    userdata.history.append({"time": datetime.utcnow().isoformat() + "Z", "action": "stop_show"})
+    return "Show stopped. Thanks for coming to Improv Battle!"
+
+
+# -------------------------
+# The Agent (Improv Host)
+# -------------------------
+class GameMasterAgent(Agent):
     def __init__(self):
-        self.order = {
-            "drinkType": "",
-            "size": "",
-            "milk": "",
-            "extras": [],
-            "name": "",
-        }
+        instructions = """
+        You are the host of a TV improv show called 'Improv Battle'.
+        Role: High-energy, witty, and clear about rules. Guide a single contestant through a series of short improv scenes.
 
-    def update_from_text(self, text: str):
-        if not text:
-            return
-        t = text.lower()
-        for d in ["latte", "cappuccino", "americano", "espresso", "mocha", "cold brew", "flat white"]:
-            if d in t:
-                self.order["drinkType"] = d
-        for s in ["small", "medium", "large"]:
-            if s in t:
-                self.order["size"] = s
-        for m in ["whole", "skim", "oat", "soy", "almond", "2%"]:
-            if m in t:
-                self.order["milk"] = m
-        for ex in ["vanilla", "caramel", "hazelnut", "whipped", "extra shot", "shot"]:
-            if ex in t and ex not in self.order["extras"]:
-                self.order["extras"].append(ex)
-        if "my name is " in t:
-            try:
-                name = t.split("my name is ", 1)[1].strip().split()[0]
-                self.order["name"] = name.capitalize()
-            except Exception:
-                pass
-        elif " for " in t:
-            try:
-                name = t.split(" for ", 1)[1].strip().split()[0]
-                self.order["name"] = name.capitalize()
-            except Exception:
-                pass
-
-    def is_complete(self) -> bool:
-        return bool(self.order["drinkType"] and self.order["size"] and self.order["milk"] and self.order["name"])
-
-    def next_question(self) -> str | None:
-        if not self.order["drinkType"]:
-            return "What would you like to drink today? We have latte, cappuccino, americano, mocha, and espresso."
-        if not self.order["size"]:
-            return "What size would you like — small, medium, or large?"
-        if not self.order["milk"]:
-            return "Which milk would you prefer — whole, skim, oat, soy or almond?"
-        if not self.order["extras"]:
-            return "Any extras — caramel, vanilla, whipped cream, or an extra shot?"
-        if not self.order["name"]:
-            return "Under what name should I put this order?"
-        return None
-
-    def save(self, folder: str = "orders") -> str:
-        os.makedirs(folder, exist_ok=True)
-        filename = f"order_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        path = os.path.join(folder, filename)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.order, f, indent=2, ensure_ascii=False)
-        return path
-
-
-#
-# ----------------------- Agent / Entry point -----------------------
-#
-class Assistant(Agent):
-    def __init__(self) -> None:
+        Behavioural rules:
+            - Introduce the show and explain the rules at the start.
+            - Present clear scenario prompts (who you are, what's happening, what's the tension).
+            - Prompt the player to improvise and listen for an explicit "End scene" or accept an utterance passed to record_performance.
+            - After each scene, react in a varied, realistic way (supportive, neutral, mildly critical). Store the reaction.
+            - Run the configured number of rounds, then summarize the player's style.
+            - Keep turns short and TTS-friendly.
+        Use the provided tools: start_show, next_scenario, record_performance, summarize_show, stop_show.
+        """
         super().__init__(
-            instructions="""You are a helpful voice AI assistant. The user is interacting with you via voice.
-You can act as a friendly barista, a grounded wellness companion, or an active recall tutor. Keep responses concise, practical and non-diagnostic.""",
+            instructions=instructions,
+            tools=[start_show, next_scenario, record_performance, summarize_show, stop_show],
         )
 
-
+# -------------------------
+# Entrypoint & Prewarm
+# -------------------------
 def prewarm(proc: JobProcess):
-    proc.userdata["vad"] = silero.VAD.load()
+    try:
+        proc.userdata["vad"] = silero.VAD.load()
+    except Exception:
+        logger.warning("VAD prewarm failed; continuing without preloaded VAD.")
 
 
 async def entrypoint(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
+    logger.info("\n" + "🎭" * 6)
+    logger.info("🚀 STARTING VOICE IMPROV HOST — Improv Battle")
+
+    userdata = Userdata()
 
     session = AgentSession(
         stt=deepgram.STT(model="nova-3"),
         llm=google.LLM(model="gemini-2.5-flash"),
         tts=murf.TTS(
-            voice="en-US-matthew",
-            style="Conversation",
-            tokenizer=tokenize.basic.SentenceTokenizer(min_sentence_len=2),
+            voice="en-US-marcus",
+            style="Conversational",
             text_pacing=True,
         ),
         turn_detection=MultilingualModel(),
-        vad=ctx.proc.userdata["vad"],
-        preemptive_generation=True,
+        vad=ctx.proc.userdata.get("vad"),
+        userdata=userdata,
     )
 
-    usage_collector = metrics.UsageCollector()
-
-    @session.on("metrics_collected")
-    def _on_metrics_collected(ev: MetricsCollectedEvent):
-        metrics.log_metrics(ev.metrics)
-        usage_collector.collect(ev.metrics)
-
-    async def log_usage():
-        summary = usage_collector.get_summary()
-        logger.info(f"Usage: {summary}")
-
-    ctx.add_shutdown_callback(log_usage)
-
+    # Start with the Improv Host agent
     await session.start(
-        agent=Assistant(),
+        agent=GameMasterAgent(),
         room=ctx.room,
         room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVC()),
     )
-
-    # managers
-    order_managers: dict[str, OrderManager] = {}
-    wellness_managers: dict[str, WellnessManager] = {}
-    tutor = TutorManager()
-    tutor_sessions = {}  # optional per-session quick state (mirrors tutor.sessions)
-
-    def get_mgr(session_id: str) -> OrderManager:
-        if session_id not in order_managers:
-            order_managers[session_id] = OrderManager()
-        return order_managers[session_id]
-
-    def get_wellness_mgr(session_id: str) -> WellnessManager:
-        if session_id not in wellness_managers:
-            wellness_managers[session_id] = WellnessManager()
-        return wellness_managers[session_id]
-
-    # ---------------------------
-    # respond factory (Option 1) - supports per-message voice override
-    # ---------------------------
-    def respond_fn_factory(sess, ctx_obj):
-        async def respond_fn(reply_text: str, voice: str | None = None):
-            sent = False
-
-            # 1) Try structured payload with TTS override (some SDKs accept object payloads)
-            if voice:
-                payload = {"text": reply_text, "tts": {"voice": voice}}
-                try:
-                    if hasattr(sess, "send_text") and callable(sess.send_text):
-                        await sess.send_text(payload)
-                        logger.debug("Sent structured payload via send_text with voice override: %s", voice)
-                        return
-                except Exception as e:
-                    logger.debug("structured send_text failed: %s", e)
-
-                try:
-                    if hasattr(sess, "publish_text") and callable(sess.publish_text):
-                        await sess.publish_text(payload)
-                        logger.debug("Sent structured payload via publish_text with voice override: %s", voice)
-                        return
-                except Exception as e:
-                    logger.debug("structured publish_text failed: %s", e)
-
-            # 2) Fallback: plain text sends
-            try:
-                if hasattr(sess, "send_text") and callable(sess.send_text):
-                    await sess.send_text(reply_text)
-                    sent = True
-            except Exception:
-                logger.debug("session.send_text not available or failed")
-
-            if not sent:
-                try:
-                    if hasattr(sess, "publish_text") and callable(sess.publish_text):
-                        await sess.publish_text(reply_text)
-                        sent = True
-                except Exception:
-                    logger.debug("session.publish_text not available or failed")
-
-            if not sent:
-                try:
-                    agent_obj = getattr(sess, "agent", None)
-                    if agent_obj and hasattr(agent_obj, "send_message"):
-                        await agent_obj.send_message(reply_text)
-                        sent = True
-                except Exception:
-                    logger.debug("agent.send_message not available or failed")
-
-            if not sent:
-                try:
-                    await ctx_obj.room.send_data(reply_text)
-                    sent = True
-                except Exception:
-                    logger.exception("Failed to send reply via any available method")
-
-        return respond_fn
-
-    # coffee handler (unchanged, short)
-    async def handle_coffee(session_id: str, user_text: str, respond_fn):
-        try:
-            mgr = get_mgr(session_id)
-            mgr.update_from_text(user_text)
-            if mgr.is_complete():
-                path = mgr.save()
-                summary_text = f"Perfect — your order is a {mgr.order['size']} {mgr.order['drinkType']} with {mgr.order['milk']} milk"
-                if mgr.order["extras"]:
-                    summary_text += f" and extras: {', '.join(mgr.order['extras'])}"
-                summary_text += f" for {mgr.order['name']}. I've saved it to {path}. Enjoy!"
-                await respond_fn(summary_text)
-                try:
-                    del order_managers[session_id]
-                except Exception:
-                    pass
-                return
-            q = mgr.next_question()
-            if q:
-                await respond_fn(q)
-                return
-            await respond_fn("Sorry, I didn't catch that. Could you repeat please?")
-        except Exception as e:
-            logger.exception("Error in handle_coffee: %s", e)
-            try:
-                await respond_fn("Something went wrong processing your order.")
-            except Exception:
-                pass
-
-    # wellness handler (unchanged)
-    async def handle_wellness(session_id: str, user_text: str, respond_fn):
-        try:
-            mgr = get_wellness_mgr(session_id)
-            mgr.update_from_text(user_text)
-            q = mgr.next_question()
-            if q:
-                await respond_fn(q)
-                mgr._asked_index += 1
-                return
-            if mgr.is_ready_to_confirm() and not mgr.is_complete():
-                summary = mgr.build_summary()
-                await respond_fn(f"Quick summary: {summary} Do you want me to save this check-in?")
-                mgr._asked_index = len(mgr.QUESTIONS) - 1
-                return
-            if mgr.is_complete():
-                path, saved_entry = mgr.save()
-                await respond_fn(f"Saved today's check-in. Summary: {saved_entry.get('summary','')}. I saved it to {path}.")
-                try:
-                    del wellness_managers[session_id]
-                except Exception:
-                    pass
-                return
-            await respond_fn("Sorry, I didn't catch that. Could you repeat or say 'save' to save this check-in?")
-        except Exception as e:
-            logger.exception("Error in handle_wellness: %s", e)
-            try:
-                await respond_fn("Something went wrong with the wellness flow.")
-            except Exception:
-                pass
-
-    # ----------------- Tutor handler (Day 4) -----------------
-    async def handle_tutor(session_id: str, user_text: str, respond_fn):
-        """
-        Handles three modes: learn, quiz, teach_back. User can say:
-        - 'learn variables' or 'learn loops'
-        - 'quiz variables'
-        - 'teach back variables'
-        - 'list concepts'
-        - 'switch to quiz'
-        Additionally supports:
-        - 'which concepts am i weakest' / 'show weakest'
-        - 'show my mastery' / 'my mastery'
-        """
-        try:
-            sess = tutor.start_session(session_id)
-            lower = (user_text or "").lower().strip()
-
-            # -------------------------
-            # quick mastery queries
-            # -------------------------
-            if "which concepts am i weakest" in lower or "which concepts am i weakest at" in lower or "weakest concepts" in lower or "show weakest" in lower:
-                weakest = tutor.get_weakest(session_id, top_n=3)
-                if not weakest:
-                    await respond_fn("I don't have any mastery data yet. Try a teach-back or quiz first.")
-                    return
-                parts = []
-                for cid, score in weakest:
-                    c = tutor.get_concept(cid)
-                    title = c.get("title") if c else cid
-                    parts.append(f"{title}: {score}")
-                await respond_fn("Your weakest concepts are: " + ", ".join(parts))
-                return
-
-            if "show my mastery" in lower or "my mastery" in lower or "show mastery" in lower:
-                m = tutor.get_mastery(session_id)
-                if not m:
-                    await respond_fn("No mastery data yet. Do a quiz or teach-back to start tracking.")
-                    return
-                lines = []
-                for cid, entry in m.items():
-                    c = tutor.get_concept(cid)
-                    title = (c.get("title") if c else cid)
-                    lines.append(f"{title} — avg_score: {entry.get('avg_score')}, last_score: {entry.get('last_score')}, taught_back: {entry.get('times_taught_back')}, quizzed: {entry.get('times_quizzed')}")
-                await respond_fn("Here is your mastery: " + " | ".join(lines))
-                return
-
-            # mode switching requests: look for "learn", "quiz", "teach back"
-            if any(word in lower for word in ("list concepts", "what concepts", "show concepts")):
-                concepts = tutor.list_concepts()
-                if not concepts:
-                    await respond_fn("I don't have any concepts loaded.")
-                    return
-                out = "I can teach these concepts: " + ", ".join([f'{c["title"]} (id: {c["id"]})' for c in concepts])
-                await respond_fn(out)
-                return
-
-            # explicit mode + concept: "learn variables", "quiz loops", "teach back variables"
-            if lower.startswith("learn ") or lower.startswith("quiz ") or lower.startswith("teach back ") or lower.startswith("teach_back "):
-                parts = lower.split()
-                mode = parts[0] if parts[0] != "teach" else (parts[0] + " " + parts[1])  # fallback
-                if parts[0] == "teach":
-                    mode = "teach_back"
-                    concept_keyword = " ".join(parts[2:]) if len(parts) > 2 else None
-                else:
-                    mode = parts[0]
-                    concept_keyword = " ".join(parts[1:]) if len(parts) > 1 else None
-
-                # normalize mode
-                if mode in ("teach", "teach_back", "teachback", "teach-back"):
-                    mode = "teach_back"
-                if mode not in ("learn", "quiz", "teach_back"):
-                    await respond_fn("I didn't understand that mode. Say learn, quiz, or teach back.")
-                    return
-
-                tutor.set_mode(session_id, mode, concept_keyword)
-                c = tutor.get_concept(tutor.get_session(session_id)["current_concept"])
-                if not c:
-                    await respond_fn("I couldn't find that concept.")
-                    return
-
-                if mode == "learn":
-                    # use per-message voice override for learn (Matthew)
-                    # record that we explained this concept
-                    tutor.record_explain(session_id, c["id"])
-                    await respond_fn(f"Learn mode — {c['title']}: {c['summary']}", voice="en-US-matthew")
-                    return
-
-                if mode == "quiz":
-                    # quiz voice (Alicia)
-                    q = tutor.ask_quiz_question(session_id)
-                    await respond_fn(f"Quiz mode — question: {q}", voice="en-US-alicia")
-                    return
-
-                if mode == "teach_back":
-                    # teach-back voice (Ken)
-                    prompt = tutor.ask_teach_back_prompt(session_id)
-                    await respond_fn(prompt, voice="en-US-ken")
-                    return
-
-            # switch requests "switch to quiz" / "switch to learn"
-            if "switch to" in lower or lower.startswith("switch "):
-                if "quiz" in lower:
-                    tutor.set_mode(session_id, "quiz")
-                    q = tutor.ask_quiz_question(session_id)
-                    await respond_fn(f"Switched to quiz. {q}", voice="en-US-alicia")
-                    return
-                if "learn" in lower:
-                    tutor.set_mode(session_id, "learn")
-                    c = tutor.get_concept(tutor.get_session(session_id)["current_concept"])
-                    # record explain exposure
-                    if c:
-                        tutor.record_explain(session_id, c["id"])
-                        await respond_fn(f"Switched to learn. {c['title']}: {c['summary']}", voice="en-US-matthew")
-                    else:
-                        await respond_fn("Switched to learn but I couldn't find the concept.", voice="en-US-matthew")
-                    return
-                if "teach" in lower:
-                    tutor.set_mode(session_id, "teach_back")
-                    p = tutor.ask_teach_back_prompt(session_id)
-                    await respond_fn(f"Switched to teach-back. {p}", voice="en-US-ken")
-                    return
-
-            # If user answered a quiz question (we assume last_question present)
-            sess_state = tutor.get_session(session_id)
-            last_q = sess_state.get("last_question") if sess_state else None
-            current_cid = sess_state.get("current_concept") if sess_state else None
-            if sess_state and sess_state.get("mode") == "quiz" and last_q:
-                # evaluate answer via teach_back evaluator
-                c = tutor.get_concept(current_cid)
-                summary = c.get("summary", "") if c else ""
-                eval_res = tutor.evaluate_teach_back(summary, user_text)
-                correct = eval_res["score"] >= 60
-                tutor.record_quiz_result(session_id, current_cid, correct)
-                if correct:
-                    await respond_fn(f"Good answer — you included the key ideas. {eval_res['feedback']}", voice="en-US-alicia")
-                else:
-                    await respond_fn(f"Not quite. {eval_res['feedback']} Here's a quick hint: {summary}", voice="en-US-alicia")
-                return
-
-            # If in teach_back mode expecting explanation
-            if sess_state and sess_state.get("mode") == "teach_back" and sess_state.get("last_question"):
-                c = tutor.get_concept(sess_state.get("current_concept"))
-                summary = c.get("summary", "") if c else ""
-                eval_res = tutor.evaluate_teach_back(summary, user_text)
-                # record taught back score
-                if c:
-                    tutor.record_taught_back(session_id, c["id"], eval_res["score"])
-                await respond_fn(f"I scored your explanation {eval_res['score']} out of 100. {eval_res['feedback']}", voice="en-US-ken")
-                return
-
-            # If none of above: see if user asked to start tutoring without explicit mode
-            if any(k in lower for k in ("tutor", "teach", "teach me", "i want to learn", "quiz me")):
-                # default to an interactive prompt asking which mode
-                await respond_fn("Sure — would you like to 'learn' the concept, 'quiz' yourself, or 'teach back'? Say: learn variables, quiz loops, or teach back variables.")
-                return
-
-            # fallback: didn't recognize as tutor input
-            await respond_fn("Tutor: I didn't quite catch a tutor command. Say 'list concepts' or 'learn variables' or 'quiz loops' or 'teach back variables'.")
-        except Exception as e:
-            logger.exception("Error in handle_tutor: %s", e)
-            try:
-                await respond_fn("Something went wrong in the tutor flow.")
-            except Exception:
-                pass
-
-    # ----------------- Unified incoming handler (unchanged but routes to tutor) -----------------
-    async def _handle_incoming_event(ev):
-        try:
-            logger.info(">>>> INCOMING EVENT FIRED <<<<")
-            logger.debug("RAW EVENT: %r", ev)
-            text = None
-            session_id = None
-            if hasattr(ev, "text"):
-                text = ev.text
-            elif hasattr(ev, "transcript"):
-                text = ev.transcript
-            elif hasattr(ev, "alternatives") and ev.alternatives:
-                alt0 = ev.alternatives[0]
-                text = getattr(alt0, "transcript", None) or getattr(alt0, "text", None)
-            elif isinstance(ev, dict):
-                for key in ("text", "transcript", "message", "body"):
-                    if key in ev:
-                        candidate = ev[key]
-                        if isinstance(candidate, dict):
-                            text = candidate.get("text") or candidate.get("transcript")
-                        else:
-                            text = candidate
-                        if text:
-                            break
-                if not text and "alternatives" in ev and ev["alternatives"]:
-                    alt0 = ev["alternatives"][0]
-                    if isinstance(alt0, dict):
-                        text = alt0.get("transcript") or alt0.get("text")
-            if not text:
-                try:
-                    msg = getattr(ev, "message", None)
-                    if msg:
-                        text = getattr(msg, "text", None) or (msg.get("text") if isinstance(msg, dict) else None)
-                except Exception:
-                    pass
-            try:
-                if hasattr(ev, "participant") and ev.participant is not None:
-                    session_id = getattr(ev.participant, "identity", None) or getattr(ev.participant, "sid", None)
-            except Exception:
-                session_id = None
-            if not session_id:
-                try:
-                    session_id = ctx.room.name
-                except Exception:
-                    session_id = "default"
-            logger.info("EXTRACTED text: %s", repr(text))
-            logger.info("SESSION_ID used: %s", session_id)
-            if not text:
-                logger.info("No text found in incoming event - ignoring.")
-                return
-            lower = text.lower() if isinstance(text, str) else ""
-            # routing priority: tutor -> wellness -> coffee
-            tutor_triggers = ("tutor", "teach me", "teach back", "quiz me", "learn", "quiz", "teach back")
-            wellness_triggers = ("check in", "wellness", "daily check", "start wellness", "how are you feeling", "how am i")
-            if any(kw in lower for kw in tutor_triggers):
-                logger.info("Routing to tutor flow")
-                await handle_tutor(session_id, text, respond_fn_factory(session, ctx))
-            elif any(kw in lower for kw in wellness_triggers):
-                logger.info("Routing to wellness flow")
-                await handle_wellness(session_id, text, respond_fn_factory(session, ctx))
-            else:
-                logger.info("Routing to coffee flow")
-                await handle_coffee(session_id, text, respond_fn_factory(session, ctx))
-        except Exception as e:
-            logger.exception("Exception in unified handler: %s", e)
-
-    # register handlers
-    try:
-        @session.on("transcript")
-        async def _on_transcript(ev):
-            await _handle_incoming_event(ev)
-    except Exception:
-        logger.debug("Failed to attach handler for 'transcript'")
-    try:
-        @session.on("transcription")
-        async def _on_transcription(ev):
-            await _handle_incoming_event(ev)
-    except Exception:
-        logger.debug("Failed to attach handler for 'transcription'")
-    try:
-        @session.on("message")
-        async def _on_message(ev):
-            await _handle_incoming_event(ev)
-    except Exception:
-        logger.debug("Failed to attach handler for 'message'")
-
-    # mention last wellness entry non-intrusively
-    try:
-        last = WellnessManager.last_entry()
-        if last:
-            short = last.get("summary") or f"mood: {last.get('mood')}, energy: {last.get('energy')}"
-            try:
-                if hasattr(session, "send_text"):
-                    await session.send_text(f"Welcome back — last time you said: {short}. Would you like to do today's check-in?")
-                else:
-                    await ctx.room.send_data(f"Welcome back — last time you said: {short}. Would you like to do today's check-in?")
-            except Exception:
-                logger.debug("Could not notify room about previous check-in")
-    except Exception:
-        logger.debug("No previous wellness entry or error reading it.")
 
     await ctx.connect()
 
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
+
+
 
