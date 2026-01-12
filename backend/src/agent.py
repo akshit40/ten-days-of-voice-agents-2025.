@@ -2,6 +2,7 @@
 import logging
 import json
 import os
+import re
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -23,6 +24,9 @@ from livekit.plugins.turn_detector.multilingual import MultilingualModel
 # existing managers (order + wellness) and new tutor manager
 from wellness_manager import WellnessManager
 from tutor_manager import TutorManager
+
+# lead manager for SDR (Day 5) - keep if present
+from lead_manager import new_lead_template, save_lead, build_summary
 
 logger = logging.getLogger("agent")
 load_dotenv(".env.local")
@@ -96,13 +100,110 @@ class OrderManager:
 
 
 #
+# ----------------------- Food Cart + Catalog Manager (Day 7) -----------------------
+#
+class CatalogManager:
+    def __init__(self, catalog_path: str):
+        self.catalog_path = catalog_path
+        self.catalog = []
+        self.by_id = {}
+        self.load_catalog()
+
+    def load_catalog(self):
+        try:
+            with open(self.catalog_path, "r", encoding="utf-8") as f:
+                self.catalog = json.load(f)
+            self.by_id = {item["id"]: item for item in self.catalog}
+        except Exception:
+            logger.exception("Failed to load catalog at %s", self.catalog_path)
+            self.catalog = []
+            self.by_id = {}
+
+    def find_by_name(self, name: str):
+        name = (name or "").lower()
+        # exact match id/name/token match
+        for item in self.catalog:
+            if name == item.get("id", "").lower() or name == item.get("name", "").lower():
+                return item
+        # token match
+        tokens = [t for t in re.split(r"\W+", name) if t]
+        for item in self.catalog:
+            item_text = (item.get("name", "") + " " + " ".join(item.get("tags", []))).lower()
+            if any(tok in item_text for tok in tokens):
+                return item
+        return None
+
+    def lookup(self, item_id: str):
+        return self.by_id.get(item_id)
+
+
+class CartManager:
+    def __init__(self):
+        # cart: dict item_id -> {item, qty}
+        self.cart = {}
+
+    def add_item(self, item, qty=1):
+        if not item or qty <= 0:
+            return
+        iid = item["id"]
+        if iid in self.cart:
+            self.cart[iid]["qty"] += int(qty)
+        else:
+            self.cart[iid] = {"item": item, "qty": int(qty)}
+
+    def remove_item(self, item_id):
+        if item_id in self.cart:
+            del self.cart[item_id]
+
+    def update_qty(self, item_id, qty):
+        if item_id in self.cart:
+            if qty <= 0:
+                del self.cart[item_id]
+            else:
+                self.cart[item_id]["qty"] = int(qty)
+
+    def list_items(self):
+        return [{"id": v["item"]["id"], "name": v["item"]["name"], "qty": v["qty"], "price": v["item"].get("price", 0)} for v in self.cart.values()]
+
+    def total(self):
+        return sum(v["qty"] * v["item"].get("price", 0) for v in self.cart.values())
+
+    def is_empty(self):
+        return len(self.cart) == 0
+
+    def clear(self):
+        self.cart = {}
+
+    def to_order_object(self, customer_name=None, address=None):
+        items = self.list_items()
+        return {
+            "order_id": f"order_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            "customer_name": customer_name or "guest",
+            "address": address or "",
+            "items": items,
+            "total": self.total(),
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    def save_order(self, folder="orders", customer_name=None, address=None):
+        order = self.to_order_object(customer_name=customer_name, address=address)
+        os.makedirs(folder, exist_ok=True)
+        filename = f"{order['order_id']}.json"
+        path = os.path.join(folder, filename)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(order, f, indent=2, ensure_ascii=False)
+        return path, order
+
+
+#
 # ----------------------- Agent / Entry point -----------------------
 #
 class Assistant(Agent):
     def __init__(self) -> None:
         super().__init__(
             instructions="""You are a helpful voice AI assistant. The user is interacting with you via voice.
-You can act as a friendly barista, a grounded wellness companion, or an active recall tutor. Keep responses concise, practical and non-diagnostic.""",
+You can act as a friendly barista, a grounded wellness companion, an active recall tutor, or a food ordering assistant.
+Keep responses concise and practical.""",
         )
 
 
@@ -110,8 +211,40 @@ def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
 
 
+# small recipes mapping for "ingredients for X" requests
+RECIPES = {
+    "peanut butter sandwich": ["bread_wholewheat", "peanut_butter_jar"],
+    "pasta for two": ["pasta_500g", "pasta_sauce", "butter_200g"],
+    "sandwich": ["bread_wholewheat", "sandwich_cheese", "tomato_ketchup"]
+}
+
+
+# helper: robust FAQ matching (reused from earlier flows)
+def best_faq_for_text(user_text: str, faq_list: list[dict]) -> tuple[dict | None, int]:
+    if not user_text or not faq_list:
+        return None, 0
+    t = user_text.lower()
+    best = None
+    best_score = 0
+    for f in faq_list:
+        q = (f.get("question") or "").lower()
+        a = (f.get("answer") or "").lower()
+        tokens = [tok for tok in re.split(r"\W+", q) if tok]
+        tokens += [tok for tok in re.split(r"\W+", a) if tok][:6]
+        score = sum(1 for tok in set(tokens) if tok and tok in t)
+        if score > best_score:
+            best_score = score
+            best = f
+    return best, best_score
+
+
 async def entrypoint(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
+
+    # set paths
+    repo_shared = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "shared-data"))
+    catalog_path = os.path.join(repo_shared, "catalog_zepto.json")
+    catalog_mgr = CatalogManager(catalog_path)
 
     session = AgentSession(
         stt=deepgram.STT(model="nova-3"),
@@ -150,7 +283,9 @@ async def entrypoint(ctx: JobContext):
     order_managers: dict[str, OrderManager] = {}
     wellness_managers: dict[str, WellnessManager] = {}
     tutor = TutorManager()
-    tutor_sessions = {}  # optional per-session quick state (mirrors tutor.sessions)
+    tutor_sessions = {}
+    # food carts per session
+    food_carts: dict[str, CartManager] = {}
 
     def get_mgr(session_id: str) -> OrderManager:
         if session_id not in order_managers:
@@ -162,48 +297,42 @@ async def entrypoint(ctx: JobContext):
             wellness_managers[session_id] = WellnessManager()
         return wellness_managers[session_id]
 
-    # ---------------------------
-    # respond factory (Option 1) - supports per-message voice override
-    # ---------------------------
+    def get_cart(session_id: str) -> CartManager:
+        if session_id not in food_carts:
+            food_carts[session_id] = CartManager()
+        return food_carts[session_id]
+
+    # respond factory
     def respond_fn_factory(sess, ctx_obj):
         async def respond_fn(reply_text: str, voice: str | None = None):
             sent = False
-
-            # 1) Try structured payload with TTS override (some SDKs accept object payloads)
             if voice:
                 payload = {"text": reply_text, "tts": {"voice": voice}}
                 try:
                     if hasattr(sess, "send_text") and callable(sess.send_text):
                         await sess.send_text(payload)
-                        logger.debug("Sent structured payload via send_text with voice override: %s", voice)
                         return
-                except Exception as e:
-                    logger.debug("structured send_text failed: %s", e)
-
+                except Exception:
+                    pass
                 try:
                     if hasattr(sess, "publish_text") and callable(sess.publish_text):
                         await sess.publish_text(payload)
-                        logger.debug("Sent structured payload via publish_text with voice override: %s", voice)
                         return
-                except Exception as e:
-                    logger.debug("structured publish_text failed: %s", e)
-
-            # 2) Fallback: plain text sends
+                except Exception:
+                    pass
             try:
                 if hasattr(sess, "send_text") and callable(sess.send_text):
                     await sess.send_text(reply_text)
                     sent = True
             except Exception:
-                logger.debug("session.send_text not available or failed")
-
+                pass
             if not sent:
                 try:
                     if hasattr(sess, "publish_text") and callable(sess.publish_text):
                         await sess.publish_text(reply_text)
                         sent = True
                 except Exception:
-                    logger.debug("session.publish_text not available or failed")
-
+                    pass
             if not sent:
                 try:
                     agent_obj = getattr(sess, "agent", None)
@@ -211,243 +340,170 @@ async def entrypoint(ctx: JobContext):
                         await agent_obj.send_message(reply_text)
                         sent = True
                 except Exception:
-                    logger.debug("agent.send_message not available or failed")
-
+                    pass
             if not sent:
                 try:
                     await ctx_obj.room.send_data(reply_text)
                     sent = True
                 except Exception:
                     logger.exception("Failed to send reply via any available method")
-
         return respond_fn
 
-    # coffee handler (unchanged, short)
-    async def handle_coffee(session_id: str, user_text: str, respond_fn):
-        try:
-            mgr = get_mgr(session_id)
-            mgr.update_from_text(user_text)
-            if mgr.is_complete():
-                path = mgr.save()
-                summary_text = f"Perfect — your order is a {mgr.order['size']} {mgr.order['drinkType']} with {mgr.order['milk']} milk"
-                if mgr.order["extras"]:
-                    summary_text += f" and extras: {', '.join(mgr.order['extras'])}"
-                summary_text += f" for {mgr.order['name']}. I've saved it to {path}. Enjoy!"
-                await respond_fn(summary_text)
-                try:
-                    del order_managers[session_id]
-                except Exception:
-                    pass
-                return
-            q = mgr.next_question()
-            if q:
-                await respond_fn(q)
-                return
-            await respond_fn("Sorry, I didn't catch that. Could you repeat please?")
-        except Exception as e:
-            logger.exception("Error in handle_coffee: %s", e)
-            try:
-                await respond_fn("Something went wrong processing your order.")
-            except Exception:
-                pass
-
-    # wellness handler (unchanged)
-    async def handle_wellness(session_id: str, user_text: str, respond_fn):
-        try:
-            mgr = get_wellness_mgr(session_id)
-            mgr.update_from_text(user_text)
-            q = mgr.next_question()
-            if q:
-                await respond_fn(q)
-                mgr._asked_index += 1
-                return
-            if mgr.is_ready_to_confirm() and not mgr.is_complete():
-                summary = mgr.build_summary()
-                await respond_fn(f"Quick summary: {summary} Do you want me to save this check-in?")
-                mgr._asked_index = len(mgr.QUESTIONS) - 1
-                return
-            if mgr.is_complete():
-                path, saved_entry = mgr.save()
-                await respond_fn(f"Saved today's check-in. Summary: {saved_entry.get('summary','')}. I saved it to {path}.")
-                try:
-                    del wellness_managers[session_id]
-                except Exception:
-                    pass
-                return
-            await respond_fn("Sorry, I didn't catch that. Could you repeat or say 'save' to save this check-in?")
-        except Exception as e:
-            logger.exception("Error in handle_wellness: %s", e)
-            try:
-                await respond_fn("Something went wrong with the wellness flow.")
-            except Exception:
-                pass
-
-    # ----------------- Tutor handler (Day 4) -----------------
-    async def handle_tutor(session_id: str, user_text: str, respond_fn):
+    # ----------------- Food ordering handler (Day 7) -----------------
+    async def handle_food(session_id: str, user_text: str, respond_fn):
         """
-        Handles three modes: learn, quiz, teach_back. User can say:
-        - 'learn variables' or 'learn loops'
-        - 'quiz variables'
-        - 'teach back variables'
-        - 'list concepts'
-        - 'switch to quiz'
-        Additionally supports:
-        - 'which concepts am i weakest' / 'show weakest'
-        - 'show my mastery' / 'my mastery'
+        Food ordering flow:
+        - interpret add/remove/list/place commands
+        - support 'ingredients for X'
+        - save order JSON when user says 'place order' or 'that's all'
         """
         try:
-            sess = tutor.start_session(session_id)
-            lower = (user_text or "").lower().strip()
+            cart = get_cart(session_id)
+            text = (user_text or "").strip()
+            lower = text.lower()
 
-            # -------------------------
-            # quick mastery queries
-            # -------------------------
-            if "which concepts am i weakest" in lower or "which concepts am i weakest at" in lower or "weakest concepts" in lower or "show weakest" in lower:
-                weakest = tutor.get_weakest(session_id, top_n=3)
-                if not weakest:
-                    await respond_fn("I don't have any mastery data yet. Try a teach-back or quiz first.")
-                    return
-                parts = []
-                for cid, score in weakest:
-                    c = tutor.get_concept(cid)
-                    title = c.get("title") if c else cid
-                    parts.append(f"{title}: {score}")
-                await respond_fn("Your weakest concepts are: " + ", ".join(parts))
+            # list catalog sample
+            if any(k in lower for k in ("what do you have", "show catalog", "menu", "what can i order")):
+                # list top categories/items (short)
+                sample = [f"{i['name']} — ₹{i.get('price', '?')}" for i in catalog_mgr.catalog[:8]]
+                await respond_fn("I have: " + "; ".join(sample) + ". You can say 'add 2 bread' or 'ingredients for peanut butter sandwich'.")
                 return
 
-            if "show my mastery" in lower or "my mastery" in lower or "show mastery" in lower:
-                m = tutor.get_mastery(session_id)
-                if not m:
-                    await respond_fn("No mastery data yet. Do a quiz or teach-back to start tracking.")
+            # show cart
+            if any(k in lower for k in ("what's in my cart", "show cart", "what is in my cart", "view cart", "cart")):
+                if cart.is_empty():
+                    await respond_fn("Your cart is empty. Want me to add something? Try 'add peanut butter'.")
                     return
-                lines = []
-                for cid, entry in m.items():
-                    c = tutor.get_concept(cid)
-                    title = (c.get("title") if c else cid)
-                    lines.append(f"{title} — avg_score: {entry.get('avg_score')}, last_score: {entry.get('last_score')}, taught_back: {entry.get('times_taught_back')}, quizzed: {entry.get('times_quizzed')}")
-                await respond_fn("Here is your mastery: " + " | ".join(lines))
+                items = cart.list_items()
+                lines = [f"{it['qty']} x {it['name']} (₹{it['price']} each)" for it in items]
+                await respond_fn("In your cart: " + " ; ".join(lines) + f". Total: ₹{cart.total()}. Say 'place order' to finalize.")
                 return
 
-            # mode switching requests: look for "learn", "quiz", "teach back"
-            if any(word in lower for word in ("list concepts", "what concepts", "show concepts")):
-                concepts = tutor.list_concepts()
-                if not concepts:
-                    await respond_fn("I don't have any concepts loaded.")
+            # place order
+            if any(k in lower for k in ("place order", "i'm done", "i am done", "that's all", "checkout", "order now")):
+                if cart.is_empty():
+                    await respond_fn("Your cart is empty — nothing to place. Say 'add bread' to add something first.")
                     return
-                out = "I can teach these concepts: " + ", ".join([f'{c["title"]} (id: {c["id"]})' for c in concepts])
-                await respond_fn(out)
+                # optional: try to extract a name/address from session text or ask
+                name_match = re.search(r"\b(name is|i am|i'm)\s+([A-Za-z\- ]{2,40})", text, re.IGNORECASE)
+                name = None
+                if name_match:
+                    name = name_match.group(2).strip()
+                # save and clear
+                path, order_obj = cart.save_order(folder=os.path.join(os.path.dirname(__file__), "..", "orders"), customer_name=name)
+                await respond_fn(f"Order placed. Summary: {len(order_obj['items'])} items, total ₹{order_obj['total']}. Saved to {path}")
+                cart.clear()
                 return
 
-            # explicit mode + concept: "learn variables", "quiz loops", "teach back variables"
-            if lower.startswith("learn ") or lower.startswith("quiz ") or lower.startswith("teach back ") or lower.startswith("teach_back "):
-                parts = lower.split()
-                mode = parts[0] if parts[0] != "teach" else (parts[0] + " " + parts[1])  # fallback
-                if parts[0] == "teach":
-                    mode = "teach_back"
-                    concept_keyword = " ".join(parts[2:]) if len(parts) > 2 else None
+            # remove item: "remove bread" or "remove 1 bread"
+            if lower.startswith("remove") or lower.startswith("delete") or lower.startswith("remove "):
+                # get name
+                m = re.search(r"(?:remove|delete)\s+(\d+)\s+(.+)", text, re.IGNORECASE)
+                if m:
+                    qty = int(m.group(1))
+                    target = m.group(2).strip()
                 else:
-                    mode = parts[0]
-                    concept_keyword = " ".join(parts[1:]) if len(parts) > 1 else None
-
-                # normalize mode
-                if mode in ("teach", "teach_back", "teachback", "teach-back"):
-                    mode = "teach_back"
-                if mode not in ("learn", "quiz", "teach_back"):
-                    await respond_fn("I didn't understand that mode. Say learn, quiz, or teach back.")
-                    return
-
-                tutor.set_mode(session_id, mode, concept_keyword)
-                c = tutor.get_concept(tutor.get_session(session_id)["current_concept"])
-                if not c:
-                    await respond_fn("I couldn't find that concept.")
-                    return
-
-                if mode == "learn":
-                    # use per-message voice override for learn (Matthew)
-                    # record that we explained this concept
-                    tutor.record_explain(session_id, c["id"])
-                    await respond_fn(f"Learn mode — {c['title']}: {c['summary']}", voice="en-US-matthew")
-                    return
-
-                if mode == "quiz":
-                    # quiz voice (Alicia)
-                    q = tutor.ask_quiz_question(session_id)
-                    await respond_fn(f"Quiz mode — question: {q}", voice="en-US-alicia")
-                    return
-
-                if mode == "teach_back":
-                    # teach-back voice (Ken)
-                    prompt = tutor.ask_teach_back_prompt(session_id)
-                    await respond_fn(prompt, voice="en-US-ken")
-                    return
-
-            # switch requests "switch to quiz" / "switch to learn"
-            if "switch to" in lower or lower.startswith("switch "):
-                if "quiz" in lower:
-                    tutor.set_mode(session_id, "quiz")
-                    q = tutor.ask_quiz_question(session_id)
-                    await respond_fn(f"Switched to quiz. {q}", voice="en-US-alicia")
-                    return
-                if "learn" in lower:
-                    tutor.set_mode(session_id, "learn")
-                    c = tutor.get_concept(tutor.get_session(session_id)["current_concept"])
-                    # record explain exposure
-                    if c:
-                        tutor.record_explain(session_id, c["id"])
-                        await respond_fn(f"Switched to learn. {c['title']}: {c['summary']}", voice="en-US-matthew")
+                    # remove all of named item
+                    m2 = re.search(r"(?:remove|delete)\s+(.+)", text, re.IGNORECASE)
+                    qty = None
+                    target = m2.group(1).strip() if m2 else None
+                if target:
+                    target_item = catalog_mgr.find_by_name(target)
+                    if target_item:
+                        iid = target_item["id"]
+                        if qty is None:
+                            cart.remove_item(iid)
+                            await respond_fn(f"Removed {target_item['name']} from your cart.")
+                        else:
+                            # reduce quantity
+                            existing = cart.cart.get(iid)
+                            if existing:
+                                newq = max(0, existing["qty"] - qty)
+                                cart.update_qty(iid, newq)
+                                await respond_fn(f"Updated {target_item['name']} quantity to {newq}.")
+                            else:
+                                await respond_fn(f"I couldn't find {target_item['name']} in your cart.")
+                        return
                     else:
-                        await respond_fn("Switched to learn but I couldn't find the concept.", voice="en-US-matthew")
+                        await respond_fn("I couldn't find that item in the catalog.")
+                        return
+
+            # add by 'ingredients for X'
+            if any(k in lower for k in ("ingredients for", "ingredients to make", "ingredients for a", "ingredients for an")):
+                # extract dish name
+                m = re.search(r"ingredients (?:for|to make)\s+(.+)", lower)
+                dish = m.group(1).strip() if m else lower.replace("ingredients for", "").strip()
+                # try direct recipe match
+                recipe_key = dish
+                if recipe_key in RECIPES:
+                    for iid in RECIPES[recipe_key]:
+                        item = catalog_mgr.lookup(iid)
+                        if item:
+                            cart.add_item(item, qty=1)
+                    await respond_fn(f"Added ingredients for {dish}: " + ", ".join([catalog_mgr.lookup(i)["name"] for i in RECIPES[recipe_key] if catalog_mgr.lookup(i)] ) + ".")
                     return
-                if "teach" in lower:
-                    tutor.set_mode(session_id, "teach_back")
-                    p = tutor.ask_teach_back_prompt(session_id)
-                    await respond_fn(f"Switched to teach-back. {p}", voice="en-US-ken")
+                # try fuzzy: match dish tokens against recipe keys
+                for key in RECIPES.keys():
+                    if all(tok in key for tok in re.split(r"\W+", dish) if tok):
+                        for iid in RECIPES[key]:
+                            item = catalog_mgr.lookup(iid)
+                            if item:
+                                cart.add_item(item, qty=1)
+                        await respond_fn(f"Added ingredients for {key}.")
+                        return
+                await respond_fn("I don't have a recipe mapping for that dish, but I can add items if you say them by name.")
+                return
+
+            # add item phrases: "add 2 bread", "i want 3 pasta", "add peanut butter"
+            m_add = re.search(r"(?:add|put|i want|i'd like|i want to add)\s*(\d+)?\s*(.+)", text, re.IGNORECASE)
+            if m_add:
+                qty = int(m_add.group(1)) if m_add.group(1) else 1
+                target = m_add.group(2).strip()
+                # clean punctuation
+                target = re.sub(r"[\.!?]$", "", target).strip()
+                # try find item
+                item = catalog_mgr.find_by_name(target)
+                if item:
+                    cart.add_item(item, qty=qty)
+                    await respond_fn(f"Added {qty} x {item['name']} to your cart. Current total ₹{cart.total()}.")
                     return
-
-            # If user answered a quiz question (we assume last_question present)
-            sess_state = tutor.get_session(session_id)
-            last_q = sess_state.get("last_question") if sess_state else None
-            current_cid = sess_state.get("current_concept") if sess_state else None
-            if sess_state and sess_state.get("mode") == "quiz" and last_q:
-                # evaluate answer via teach_back evaluator
-                c = tutor.get_concept(current_cid)
-                summary = c.get("summary", "") if c else ""
-                eval_res = tutor.evaluate_teach_back(summary, user_text)
-                correct = eval_res["score"] >= 60
-                tutor.record_quiz_result(session_id, current_cid, correct)
-                if correct:
-                    await respond_fn(f"Good answer — you included the key ideas. {eval_res['feedback']}", voice="en-US-alicia")
-                else:
-                    await respond_fn(f"Not quite. {eval_res['feedback']} Here's a quick hint: {summary}", voice="en-US-alicia")
+                # If user gave an item id maybe
+                item_by_id = catalog_mgr.lookup(target)
+                if item_by_id:
+                    cart.add_item(item_by_id, qty=qty)
+                    await respond_fn(f"Added {qty} x {item_by_id['name']} to your cart. Current total ₹{cart.total()}.")
+                    return
+                await respond_fn("I couldn't find that item in the catalog. Try another name (e.g., 'add peanut butter').")
                 return
 
-            # If in teach_back mode expecting explanation
-            if sess_state and sess_state.get("mode") == "teach_back" and sess_state.get("last_question"):
-                c = tutor.get_concept(sess_state.get("current_concept"))
-                summary = c.get("summary", "") if c else ""
-                eval_res = tutor.evaluate_teach_back(summary, user_text)
-                # record taught back score
-                if c:
-                    tutor.record_taught_back(session_id, c["id"], eval_res["score"])
-                await respond_fn(f"I scored your explanation {eval_res['score']} out of 100. {eval_res['feedback']}", voice="en-US-ken")
+            # quick update qty pattern: "change bread to 2"
+            m_upd = re.search(r"(?:update|change|set)\s+(.+?)\s+(?:to|=)\s*(\d+)", text, re.IGNORECASE)
+            if m_upd:
+                name = m_upd.group(1).strip()
+                qty = int(m_upd.group(2))
+                it = catalog_mgr.find_by_name(name)
+                if it:
+                    cart.update_qty(it["id"], qty)
+                    await respond_fn(f"Updated {it['name']} quantity to {qty}. Total ₹{cart.total()}.")
+                    return
+                await respond_fn("Couldn't find that item to update.")
                 return
 
-            # If none of above: see if user asked to start tutoring without explicit mode
-            if any(k in lower for k in ("tutor", "teach", "teach me", "i want to learn", "quiz me")):
-                # default to an interactive prompt asking which mode
-                await respond_fn("Sure — would you like to 'learn' the concept, 'quiz' yourself, or 'teach back'? Say: learn variables, quiz loops, or teach back variables.")
+            # If nothing matched but user said 'food' or 'order' start ordering prompt
+            if any(k in lower for k in ("food", "grocery", "groceries", "order food", "order groceries", "i want groceries", "i want food")):
+                await respond_fn("I can add items to your cart. Say: 'add peanut butter', 'ingredients for peanut butter sandwich', 'show cart', or 'place order'.")
                 return
 
-            # fallback: didn't recognize as tutor input
-            await respond_fn("Tutor: I didn't quite catch a tutor command. Say 'list concepts' or 'learn variables' or 'quiz loops' or 'teach back variables'.")
+            # fallback fallback for food route: ask clarifying
+            await respond_fn("For ordering: say 'add <item>' or 'ingredients for <dish>' or 'show cart' or 'place order'.")
         except Exception as e:
-            logger.exception("Error in handle_tutor: %s", e)
+            logger.exception("Error in handle_food: %s", e)
             try:
-                await respond_fn("Something went wrong in the tutor flow.")
+                await respond_fn("Sorry, something went wrong with the ordering flow.")
             except Exception:
                 pass
 
-    # ----------------- Unified incoming handler (unchanged but routes to tutor) -----------------
+    # ----------------- Unified incoming handler (routes to flows) -----------------
     async def _handle_incoming_event(ev):
         try:
             logger.info(">>>> INCOMING EVENT FIRED <<<<")
@@ -498,10 +554,21 @@ async def entrypoint(ctx: JobContext):
                 logger.info("No text found in incoming event - ignoring.")
                 return
             lower = text.lower() if isinstance(text, str) else ""
-            # routing priority: tutor -> wellness -> coffee
+
+            # routing priority:
+            # food -> SDR -> tutor -> wellness -> coffee
+            food_triggers = ("add", "ingredients", "place order", "show cart", "menu", "catalog", "order", "grocery", "groceries", "food")
+            sdr_triggers = ("sales", "pricing", "demo", "book demo", "interested", "contact", "sdr", "lead", "price", "cost", "product", "trial", "free")
             tutor_triggers = ("tutor", "teach me", "teach back", "quiz me", "learn", "quiz", "teach back")
             wellness_triggers = ("check in", "wellness", "daily check", "start wellness", "how are you feeling", "how am i")
-            if any(kw in lower for kw in tutor_triggers):
+
+            if any(kw in lower for kw in food_triggers):
+                logger.info("Routing to food flow")
+                await handle_food(session_id, text, respond_fn_factory(session, ctx))
+            elif any(kw in lower for kw in sdr_triggers):
+                logger.info("Routing to SDR flow")
+                await handle_sdr(session_id, text, respond_fn_factory(session, ctx))
+            elif any(kw in lower for kw in tutor_triggers):
                 logger.info("Routing to tutor flow")
                 await handle_tutor(session_id, text, respond_fn_factory(session, ctx))
             elif any(kw in lower for kw in wellness_triggers):
@@ -553,4 +620,3 @@ async def entrypoint(ctx: JobContext):
 
 if __name__ == "__main__":
     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=prewarm))
-

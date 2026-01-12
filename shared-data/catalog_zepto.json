@@ -1,0 +1,17 @@
+[
+  {"id": "p001", "name": "Bread (sliced)", "category": "Groceries", "price": 40.0, "tags": ["bakery"]},
+  {"id": "p002", "name": "Peanut Butter - 400g", "category": "Groceries", "price": 180.0, "tags": ["spread"]},
+  {"id": "p003", "name": "Pasta - 500g", "category": "Groceries", "price": 120.0, "tags": ["pasta"]},
+  {"id": "p004", "name": "Tomato Pasta Sauce - 300g", "category": "Groceries", "price": 95.0, "tags": ["sauce"]},
+  {"id": "p005", "name": "Parmesan - 100g", "category": "Groceries", "price": 210.0, "tags": ["dairy"]},
+  {"id": "p006", "name": "Eggs - dozen", "category": "Groceries", "price": 80.0, "tags": ["dairy","protein"]},
+  {"id": "p007", "name": "Milk - 1L", "category": "Groceries", "price": 55.0, "tags": ["dairy"]},
+  {"id": "p008", "name": "Butter - 200g", "category": "Groceries", "price": 150.0, "tags": ["dairy"]},
+  {"id": "p009", "name": "Garlic Naan (single)", "category": "Prepared Food", "price": 40.0, "tags": ["bread","prepared"]},
+  {"id": "p010", "name": "Masala Papad (pack of 4)", "category": "Snacks", "price": 60.0, "tags": ["snack"]},
+  {"id": "p011", "name": "Chocolate Cookies - pack", "category": "Snacks", "price": 90.0, "tags": ["snack","sweet"]},
+  {"id": "p012", "name": "Tomatoes - 1kg", "category": "Groceries", "price": 80.0, "tags": ["veg"]},
+  {"id": "p013", "name": "Onions - 1kg", "category": "Groceries", "price": 45.0, "tags": ["veg"]},
+  {"id": "p014", "name": "Salt - 1kg", "category": "Groceries", "price": 30.0, "tags": ["pantry"]},
+  {"id": "p015", "name": "Sugar - 1kg", "category": "Groceries", "price": 50.0, "tags": ["pantry"]}
+]
