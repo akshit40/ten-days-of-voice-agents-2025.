@@ -1,0 +1,14 @@
+[
+  {
+    "id": "variables",
+    "title": "Variables",
+    "summary": "Variables store values so you can reuse them, give them names, and update them. They let you hold data like numbers and text so programs can operate on that data later. Example: x = 5 assigns the value 5 to the variable x.",
+    "sample_question": "What is a variable and why is it useful?"
+  },
+  {
+    "id": "loops",
+    "title": "Loops",
+    "summary": "Loops let you repeat an action multiple times without writing the same code repeatedly. A for loop iterates a fixed number of times (often over a list), while a while loop repeats until a condition changes.",
+    "sample_question": "Explain the difference between a for loop and a while loop."
+  }
+]
